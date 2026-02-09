@@ -548,6 +548,19 @@ class FusedMoE(CustomOp):
         )
         self.routing_method_type: RoutingMethodType = self.router.routing_method_type
 
+        # For MORI EP without DP, use scheduler's max_num_batched_tokens
+        # instead of the DP chunk size, as MORI needs to handle full batches
+        moe_max_num_tokens = envs.VLLM_MOE_DP_CHUNK_SIZE
+        if (self.moe_parallel_config.use_ep
+                and self.moe_parallel_config.all2all_backend == "mori"
+                and self.moe_parallel_config.dp_size == 1):
+            moe_max_num_tokens = (
+                vllm_config.scheduler_config.max_num_batched_tokens)
+            logger.info(
+                "MORI EP: Using max_num_tokens=%d from scheduler config",
+                moe_max_num_tokens,
+            )
+
         self.moe_config: FusedMoEConfig = FusedMoEConfig(
             num_experts=self.global_num_experts,
             experts_per_token=top_k,
@@ -557,7 +570,7 @@ class FusedMoE(CustomOp):
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=moe_in_dtype,
             router_logits_dtype=router_logits_dtype,
-            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+            max_num_tokens=moe_max_num_tokens,
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
@@ -1575,8 +1588,17 @@ class FusedMoE(CustomOp):
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
         """
         Some combine kernels reduce across GPU ranks by default.
+        When using MORI EP or other backends that reduce output internally,
+        we should skip the additional all-reduce here.
         """
-        if self.must_reduce_shared_expert_outputs():
+        # Check if output is already reduced:
+        # 1. Standard check via must_reduce_shared_expert_outputs()
+        # 2. OR if MORI is used (which reduces routed output internally)
+        uses_mori = (
+            self.moe_parallel_config is not None
+            and self.moe_parallel_config.all2all_backend == "mori"
+        )
+        if self.must_reduce_shared_expert_outputs() or uses_mori:
             return final_hidden_states
         else:
             return tensor_model_parallel_all_reduce(final_hidden_states)
@@ -1663,6 +1685,11 @@ class FusedMoE(CustomOp):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
+        # For AITER with MORI EP: Return None because MORI handles the
+        # global->local conversion and weight zeroing internally.
+        # AITER can't handle -1 values in expert_map.
+        if self.rocm_aiter_fmoe_enabled and self.use_mori_kernels:
+            return None
         return (
             self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
         )

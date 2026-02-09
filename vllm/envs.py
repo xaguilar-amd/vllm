@@ -189,6 +189,8 @@ if TYPE_CHECKING:
     VLLM_MORIIO_QP_PER_TRANSFER: int = 1
     VLLM_MORIIO_POST_BATCH_SIZE: int = -1
     VLLM_MORIIO_NUM_WORKERS: int = 1
+    # MORI-EP settings for Expert Parallelism dispatch/combine
+    VLLM_MORI_EP_USE_FP8_DISPATCH: bool = False
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
@@ -1338,6 +1340,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Controls the number of workers for Mori operations for the Mori-IO connector
     "VLLM_MORIIO_NUM_WORKERS": lambda: int(os.getenv("VLLM_MORIIO_NUM_WORKERS", "1")),
+    # MORI-EP: Use FP8 quantization for dispatch (2x bandwidth savings)
+    "VLLM_MORI_EP_USE_FP8_DISPATCH": lambda: (
+        os.getenv("VLLM_MORI_EP_USE_FP8_DISPATCH", "False").lower() in ("true", "1")
+    ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")

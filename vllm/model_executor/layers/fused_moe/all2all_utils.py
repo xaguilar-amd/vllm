@@ -24,7 +24,7 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoEP,
 )
 from vllm.platforms import current_platform
-from vllm.utils.import_utils import has_deep_ep, has_mori, has_pplx
+from vllm.utils.import_utils import has_deep_ep, has_pplx
 
 logger = init_logger(__name__)
 
@@ -40,8 +40,14 @@ if current_platform.is_cuda_alike():
             DEEPEP_QUANT_BLOCK_SHAPE,
             DeepEPLLPrepareAndFinalize,
         )
-    if has_mori():
-        from .mori_prepare_finalize import MoriPrepareAndFinalize
+
+# MORI-EP is ROCm-specific
+if current_platform.is_rocm():
+    from .mori_prepare_finalize import (
+        MoriPrepareAndFinalize,
+        is_mori_ep_available,
+    )
+    from .mori_utils import MoriEpConfig, create_mori_ep_op
 
 
 def maybe_roundup_layer_hidden_size(
@@ -208,35 +214,31 @@ def maybe_make_prepare_finalize(
             local_expert_global_ids=local_expert_global_ids,
         )
     elif moe.use_mori_kernels:
-        assert quant_config is not None
+        # MORI-EP: AMD-optimized dispatch/combine + AITER compute
+        if not current_platform.is_rocm() or not is_mori_ep_available():
+            raise RuntimeError(
+                "MORI backend requires ROCm platform and MORI package. "
+                "Install from https://github.com/ROCm/mori"
+            )
 
-        # Note: We may want to use FP8 dispatch just to reduce
-        # data movement.
-        use_fp8_dispatch = (
-            quant_config.is_per_act_token or quant_config.is_block_quantized
-        )
-        # For PTPC (per token per channel) quant, the scale dim for each token is 1
-        # For 1x128 quant, the scale dim for each token is hidden_dim // 128
-        scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
-        all_to_all_args = dict(
+        mori_config = MoriEpConfig(
             rank=all2all_manager.rank,
-            num_ep_ranks=all2all_manager.world_size,
-            quant_dtype=quant_config.quant_dtype,
-            token_hidden_size=moe.hidden_dim,
-            scale_dim=scale_dim,
-            scale_type_size=torch.float32.itemsize,
-            max_num_tokens_per_dp_rank=moe.max_num_tokens,
-            input_dtype=moe.in_dtype,
-            num_local_experts=moe.num_experts // all2all_manager.world_size,
-            num_experts_per_token=moe.experts_per_token,
+            world_size=all2all_manager.world_size,
+            hidden_dim=moe.hidden_dim,
+            max_num_tokens=moe.max_num_tokens,
+            num_experts=moe.num_experts,
+            topk=moe.experts_per_token,
+            dtype=moe.in_dtype,
         )
-        handle = all2all_manager.get_handle(all_to_all_args)
+        ep_op = create_mori_ep_op(mori_config)
 
         prepare_finalize = MoriPrepareAndFinalize(
-            handle,
-            max_tokens_per_rank=moe.max_num_tokens,
-            num_dispatchers=all2all_manager.world_size,
-            use_fp8_dispatch=use_fp8_dispatch,
+            ep_op=ep_op,
+            num_local_experts=moe.num_local_experts,
+            rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
+            ep_size=all2all_manager.world_size,
+            num_experts=moe.num_experts,
+            dp_size=moe.dp_size,
         )
 
     elif moe.use_fi_all2allv_kernels:

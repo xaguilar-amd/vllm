@@ -87,16 +87,27 @@ class SharedFusedMoE(FusedMoE):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # When using MORI EP, the combine phase ONLY reduces routed expert
+        # outputs. Shared expert outputs are NOT reduced by MORI, so we
+        # MUST explicitly reduce them with tensor_model_parallel_all_reduce.
+        uses_mori = (
+            self.moe_parallel_config is not None
+            and self.moe_parallel_config.all2all_backend == "mori"
+        )
+
         if not self.use_overlapped:
             if self._shared_experts is not None:
                 shared_out = self._shared_experts(hidden_states)
 
                 # Reduce shared expert outputs if necessary, since the MLP
                 # should have been created with reduce_results=False.
+                tp_size = get_tensor_model_parallel_world_size()
+                must_reduce = self.must_reduce_shared_expert_outputs()
+                should_reduce = must_reduce or uses_mori
                 if (
                     self.reduce_results
-                    and get_tensor_model_parallel_world_size() > 1
-                    and self.must_reduce_shared_expert_outputs()
+                    and tp_size > 1
+                    and should_reduce
                 ):
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
             else:
@@ -112,11 +123,14 @@ class SharedFusedMoE(FusedMoE):
                 router_logits=router_logits,
             )
             # ensure early TP reduction of shared expert outputs when required
+            tp_size = get_tensor_model_parallel_world_size()
+            must_reduce = self.must_reduce_shared_expert_outputs()
+            should_reduce = must_reduce or uses_mori
             if (
                 shared_out is not None
                 and self.reduce_results
-                and get_tensor_model_parallel_world_size() > 1
-                and self.must_reduce_shared_expert_outputs()
+                and tp_size > 1
+                and should_reduce
             ):
                 shared_out = tensor_model_parallel_all_reduce(shared_out)
         return shared_out, fused_out
