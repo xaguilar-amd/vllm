@@ -1800,7 +1800,12 @@ class FusedMoE(CustomOp):
 
         ctx = get_forward_context()
         # flashinfer_cutlass_kernels can handle: optional DP + TP/EP
-        max_tokens_across_dispatchers = ctx.dp_metadata.max_tokens_across_dp_cpu
+        # For EP-only (no DP), ctx.dp_metadata is None - use full batch size
+        if ctx.dp_metadata is not None:
+            max_tokens_across_dispatchers = ctx.dp_metadata.max_tokens_across_dp_cpu
+        else:
+            # EP-only without DP: use full batch size
+            max_tokens_across_dispatchers = full_hidden_states.size(0)
         moe_dp_chunk_size_per_rank = self.moe_config.max_num_tokens
 
         # If the input to the MoE is sequence parallel then divide by sp_size
@@ -1821,9 +1826,15 @@ class FusedMoE(CustomOp):
             # clamp start and end
             chunk_start = min(chunk_start, num_tokens - 1)
             chunk_end = min(chunk_end, num_tokens)
-            with ctx.dp_metadata.chunked_sizes(
-                self.sp_size, moe_dp_chunk_size_per_rank, chunk_idx
-            ):
+            # For EP-only (no DP), ctx.dp_metadata is None - use nullcontext
+            dp_ctx = (
+                ctx.dp_metadata.chunked_sizes(
+                    self.sp_size, moe_dp_chunk_size_per_rank, chunk_idx
+                )
+                if ctx.dp_metadata
+                else nullcontext()
+            )
+            with dp_ctx:
                 process_chunk(
                     chunk_start, chunk_end, skip_result_store=chunk_start_ >= num_tokens
                 )

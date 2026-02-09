@@ -88,6 +88,21 @@ def maybe_make_prepare_finalize(
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     allow_new_interface: bool = False,
 ) -> FusedMoEPrepareAndFinalize | None:
+    # #region agent log
+    import sys, json
+    print(json.dumps({
+        'timestamp': __import__('time').time() * 1000,
+        'location': 'all2all_utils.py:79',
+        'message': 'maybe_make_prepare_finalize called',
+        'data': {
+            'use_all2all_kernels': moe.moe_parallel_config.use_all2all_kernels,
+            'all2all_backend': moe.moe_parallel_config.all2all_backend,
+            'use_mori_kernels': moe.use_mori_kernels,
+            'allow_new_interface': allow_new_interface
+        },
+        'hypothesisId': 'A,B'
+    }), file=sys.stderr)
+    # #endregion
     # NOTE(rob): we are migrating each quant_method to hold the MK
     # in all cases. The allow_new_interface=False flag allow us to fall
     # back to the old method for methods that have not yet been migrated.
@@ -103,6 +118,20 @@ def maybe_make_prepare_finalize(
     #     always return a PrepareAndFinalize object and the quant method
     #     holds the ModularKernel.
     if not moe.moe_parallel_config.use_all2all_kernels:
+        # #region agent log
+        print(json.dumps({
+            'timestamp': __import__('time').time() * 1000,
+            'location': 'all2all_utils.py:120',
+            'message': 'use_all2all_kernels=False',
+            'data': {
+                'use_all2all_kernels': moe.moe_parallel_config.use_all2all_kernels,
+                'allow_new_interface': allow_new_interface,
+                'use_ep': moe.moe_parallel_config.use_ep,
+                'ep_size': moe.moe_parallel_config.ep_size,
+            },
+            'hypothesisId': 'A'
+        }), file=sys.stderr)
+        # #endregion
         if not allow_new_interface:
             return None
 
@@ -120,6 +149,81 @@ def maybe_make_prepare_finalize(
             )
         else:
             return MoEPrepareAndFinalizeNoEP()
+
+    # Handle MORI separately as it doesn't use all2all_manager
+    if moe.use_mori_kernels:
+        # #region agent log
+        import sys, json
+        print(json.dumps({
+            'timestamp': __import__('time').time() * 1000,
+            'location': 'all2all_utils.py:154',
+            'message': 'MORI branch entered (before all2all_manager)',
+            'data': {
+                'is_rocm': current_platform.is_rocm(),
+                'use_mori_kernels': moe.use_mori_kernels,
+            },
+            'hypothesisId': 'B,D'
+        }), file=sys.stderr)
+        # #endregion
+        
+        # MORI-EP: AMD-optimized dispatch/combine + AITER compute
+        if not current_platform.is_rocm() or not is_mori_ep_available():
+            raise RuntimeError(
+                "MORI backend requires ROCm platform and MORI package. "
+                "Install from https://github.com/ROCm/mori"
+            )
+
+        # Get EP group parameters directly (MORI doesn't use all2all_manager)
+        ep_group = get_ep_group()
+        
+        # #region agent log
+        print(json.dumps({
+            'timestamp': __import__('time').time() * 1000,
+            'location': 'all2all_utils.py:175',
+            'message': 'Before MoriEpConfig creation',
+            'data': {
+                'rank': ep_group.rank,
+                'world_size': ep_group.world_size,
+                'hidden_dim': moe.hidden_dim,
+                'max_num_tokens': moe.max_num_tokens,
+                'num_experts': moe.num_experts,
+                'topk': moe.experts_per_token
+            },
+            'hypothesisId': 'C'
+        }), file=sys.stderr)
+        # #endregion
+        
+        mori_config = MoriEpConfig(
+            rank=ep_group.rank,
+            world_size=ep_group.world_size,
+            hidden_dim=moe.hidden_dim,
+            max_num_tokens=moe.max_num_tokens,
+            num_experts=moe.num_experts,
+            topk=moe.experts_per_token,
+            dtype=moe.in_dtype,
+        )
+        ep_op = create_mori_ep_op(mori_config)
+
+        prepare_finalize = MoriPrepareAndFinalize(
+            ep_op=ep_op,
+            num_local_experts=moe.num_local_experts,
+            rank_expert_offset=ep_group.rank * moe.num_local_experts,
+            ep_size=ep_group.world_size,
+            num_experts=moe.num_experts,
+            dp_size=moe.dp_size,
+        )
+        
+        # #region agent log
+        print(json.dumps({
+            'timestamp': __import__('time').time() * 1000,
+            'location': 'all2all_utils.py:210',
+            'message': 'MoriPrepareAndFinalize created successfully',
+            'data': {'prepare_finalize_type': str(type(prepare_finalize))},
+            'hypothesisId': 'A,C'
+        }), file=sys.stderr)
+        # #endregion
+        
+        return prepare_finalize
 
     all2all_manager = get_ep_group().device_communicator.all2all_manager
     assert all2all_manager is not None
@@ -212,33 +316,6 @@ def maybe_make_prepare_finalize(
             global_to_physical=global_to_physical,
             physical_to_global=physical_to_global,
             local_expert_global_ids=local_expert_global_ids,
-        )
-    elif moe.use_mori_kernels:
-        # MORI-EP: AMD-optimized dispatch/combine + AITER compute
-        if not current_platform.is_rocm() or not is_mori_ep_available():
-            raise RuntimeError(
-                "MORI backend requires ROCm platform and MORI package. "
-                "Install from https://github.com/ROCm/mori"
-            )
-
-        mori_config = MoriEpConfig(
-            rank=all2all_manager.rank,
-            world_size=all2all_manager.world_size,
-            hidden_dim=moe.hidden_dim,
-            max_num_tokens=moe.max_num_tokens,
-            num_experts=moe.num_experts,
-            topk=moe.experts_per_token,
-            dtype=moe.in_dtype,
-        )
-        ep_op = create_mori_ep_op(mori_config)
-
-        prepare_finalize = MoriPrepareAndFinalize(
-            ep_op=ep_op,
-            num_local_experts=moe.num_local_experts,
-            rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
-            ep_size=all2all_manager.world_size,
-            num_experts=moe.num_experts,
-            dp_size=moe.dp_size,
         )
 
     elif moe.use_fi_all2allv_kernels:

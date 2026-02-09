@@ -287,9 +287,9 @@ def rocm_aiter_fused_experts(
 
 
 class AiterExperts(mk.FusedMoEPermuteExpertsUnpermute):
-    @property
-    def expects_unquantized_inputs(self) -> bool:
-        return True
+    # Note: expects_unquantized_inputs defaults to False in base class
+    # When MORI-EP is used, inputs must be pre-quantized before dispatch
+    # AITER will receive quantized inputs from MORI and handle them correctly
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
