@@ -99,16 +99,16 @@ class SharedFusedMoE(FusedMoE):
             if self._shared_experts is not None:
                 shared_out = self._shared_experts(hidden_states)
 
-                # Reduce shared expert outputs if necessary, since the MLP
-                # should have been created with reduce_results=False.
+                # Reduce shared expert outputs when using MORI EP.
+                # MORI combine only reduces ROUTED expert outputs.
+                # Shared expert outputs (from TP-split RowParallelLinear)
+                # must be explicitly all-reduced here.
+                # NOTE: Do NOT gate on self.reduce_results - that controls
+                # the *routed* output reduction path, not the shared expert.
                 tp_size = get_tensor_model_parallel_world_size()
                 must_reduce = self.must_reduce_shared_expert_outputs()
                 should_reduce = must_reduce or uses_mori
-                if (
-                    self.reduce_results
-                    and tp_size > 1
-                    and should_reduce
-                ):
+                if tp_size > 1 and should_reduce:
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
             else:
                 shared_out = None
@@ -122,13 +122,14 @@ class SharedFusedMoE(FusedMoE):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
-            # ensure early TP reduction of shared expert outputs when required
+            # Reduce shared expert outputs when using MORI EP.
+            # Same as sequential path: MORI combine only reduces routed output,
+            # shared expert output needs explicit TP all-reduce.
             tp_size = get_tensor_model_parallel_world_size()
             must_reduce = self.must_reduce_shared_expert_outputs()
             should_reduce = must_reduce or uses_mori
             if (
                 shared_out is not None
-                and self.reduce_results
                 and tp_size > 1
                 and should_reduce
             ):

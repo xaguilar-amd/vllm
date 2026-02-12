@@ -782,10 +782,13 @@ class FusedMoE(CustomOp):
 
     @property
     def use_dp_chunking(self) -> bool:
+        # NOTE: MORI kernels are NOT included here -- MORI handles its own
+        # dispatch/combine internally and should NOT use the DP-chunked path.
+        # Including use_mori_kernels here would incorrectly route MORI through
+        # forward_impl_chunked and skip the TP all-reduce path in reduce_output.
         return (
             self.moe_parallel_config.use_pplx_kernels
             or self.moe_parallel_config.use_deepep_ll_kernels
-            or self.moe_parallel_config.use_mori_kernels
             or self.moe_parallel_config.use_fi_all2allv_kernels
         ) and envs.VLLM_ENABLE_MOE_DP_CHUNK
 
