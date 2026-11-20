@@ -6,6 +6,10 @@
 
 from __future__ import annotations
 
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.arch import (  # noqa: E501
+    GFX942,
+)
+
 from .geometry_config import (
     MAX_LAYERS_PER_STEP,
     ML4_CONFIG,
@@ -22,7 +26,9 @@ WAVES = THREADS // 64
 QKV_A_TILE = 16
 Q_B_TILE = 16
 UK_TILE = 128
-UV_TILE = 64
+# gfx942: four W_UV tasks a head, each merging one latent quarter of the
+# splits (the kernel's `_UV_SLICE`)
+UV_TILE = 32 if GFX942 else 64
 ROW_TILE = 32
 ROUTER_TILE = 8
 UG_TILE = 16

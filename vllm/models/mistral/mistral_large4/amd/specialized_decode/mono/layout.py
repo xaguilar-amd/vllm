@@ -8,6 +8,10 @@
 import math
 import os
 
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.arch import (
+    GFX942,
+)
+
 from .geometry import (
     BLOCKS,
     Q_B_TILE,
@@ -133,7 +137,9 @@ def paged_row_contract(
 INDEX_CP_TILE = 4096
 INDEX_RADIX_DIGITS = 4
 INDEX_RADIX_BINS = 256
-INDEX_LOCAL_LDS_CAPACITY = 16384
+# Keys (one f32 score each) a select task stages in LDS: 64 KB on gfx950,
+# 32 KB of gfx942's 64 KB.
+INDEX_LOCAL_LDS_CAPACITY = 8192 if GFX942 else 16384
 
 
 def indexer_uses_tiles(index_max_seq: int, indexer_cp: bool) -> bool:
@@ -160,7 +166,8 @@ def indexer_uses_tiles(index_max_seq: int, indexer_cp: bool) -> bool:
 # The tree ends at the level holding a single list.  This is DeepSeek-V4.1's
 # design (``atom/models/deepseek_v41/mono/index_plan.py:95-154``) at these
 # constants: INDEX_SEG 16384, topk 2048 -> fan 8 -> two merge levels reach
-# 16384 * 8 * 8 = 1048576, with no LDS beyond today's.
+# 16384 * 8 * 8 = 1048576, with no LDS beyond today's.  gfx942's INDEX_SEG
+# 8192 has fan 4: two levels reach 131072, three 524288.
 INDEX_SEG = INDEX_LOCAL_LDS_CAPACITY
 
 
@@ -252,8 +259,38 @@ def dn_tile(samples: int, expert_mxfp4: bool = False) -> int:
 
 
 def sparse_keys_per_task(samples: int, heads: int = WAVES) -> int:
-    """Use narrower sparse tiles when samples or attention heads fill LDS."""
+    """Use narrower sparse tiles when samples or attention heads fill LDS.
+    gfx942's 64 KB of LDS holds 32 keys' latent and k_pe tiles (47 KB with 8
+    heads' q), not 64 (85 KB)."""
+    if GFX942:
+        return 32
     return 32 if heads > 2 * WAVES or (heads == WAVES and samples > 4) else 64
+
+
+def cache_per_row() -> bool:
+    """One cache-insert task per row rather than one for the launch (gfx942).
+    A row is a chain of dependent loads, polls and block reductions, so rows on
+    one CTA add up."""
+    return GFX942
+
+
+def qkv_index_tasks(with_indexer: bool) -> int:
+    """Extra ``qkv_a`` tasks that own the index key / head-weight tiles (gfx942).
+    Riding on the first kv_a tasks, they made those the stage's stragglers, and
+    every later task on those CTAs waited."""
+    if not (with_indexer and GFX942):
+        return 0
+    return (INDEX_DIM + INDEX_HEADS) // QKV_A_TILE
+
+
+def qkv_sample_tiles(samples: int) -> int:
+    """``qkv_a`` tasks per tile row (gfx942): one per four-sample staging tile, so
+    a wide step's tiles run on separate CTAs rather than one after another in
+    the same task, which re-read its weights for each anyway. They head the
+    step's critical path."""
+    if not GFX942:
+        return 1
+    return (samples + 3) // 4
 
 
 def sample_wave_batches(samples: int) -> int:
@@ -411,6 +448,15 @@ def layout(
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
         ("xqd", samples * HIDDEN * 4),
     ]
+    if GFX942:
+        # the merged attention latent, quarter by quarter (`_UV_SLICE`)
+        items += [("lat", samples * heads * KV_LORA // 2 * pair_bytes)]
+        # `down`'s FP8 mid, quantized once (`_DN_MID8`): four E4M3 bytes per
+        # tagged word, and each 128-block's scale times its route weight
+        items += [
+            ("mid8", samples * MOE_SLOTS * inter // 4 * pair_bytes),
+            ("mid8s", samples * MOE_SLOTS * inter // 128 * pair_bytes),
+        ]
     if with_indexer:
         items += [
             ("index_k", samples * INDEX_DIM * pair_bytes),
@@ -544,9 +590,12 @@ def stage_tasks(
     """
     index_ranks = index_cp_world(npes, samples, index_max_seq) if indexer_cp else 1
     tasks = [
-        ("qkv_a", N_QKV_A),
+        (
+            "qkv_a",
+            (N_QKV_A + qkv_index_tasks(with_indexer)) * qkv_sample_tiles(samples),
+        ),
         ("q_norm", samples),
-        ("cache", 1),
+        ("cache", samples if cache_per_row() else 1),
         ("q_b", heads * (NOPE_DIM + Q_PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:

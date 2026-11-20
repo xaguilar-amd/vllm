@@ -104,7 +104,8 @@ class SpecializedDecode:
             raise RuntimeError(
                 "Mistral Large 4 specialized decode: first bind during graph capture"
             )
-        reasons = cache_refusals(self.model, self.runner.max_model_len)
+        first = self.config.first_layer
+        reasons = cache_refusals(self.model, self.runner.max_model_len, first)
         slots = context.slot_mapping
         index_slots = slots.get(self.index_name)
         if index_slots is None or not torch.equal(
@@ -112,6 +113,18 @@ class SpecializedDecode:
         ):
             # the kernels insert K/V and the index key through one slot mapping
             reasons.append("the index cache does not share the KV cache's block ids")
+        if first == 0:
+            # ... and every launch reads layer 1's block table
+            name = self.model.layers[0].self_attn.attn.layer_name
+            md0 = context.attn_metadata.get(name)
+            md1 = context.attn_metadata[self.layer_name]
+            if (
+                md0 is None
+                or md0.block_table.data_ptr() != md1.block_table.data_ptr()
+                or slots.get(name) is None
+                or slots[name].data_ptr() != slots[self.layer_name].data_ptr()
+            ):
+                reasons.append("layer 0 does not share layer 1's block table")
         if not tp_agree(not reasons):
             raise ValueError(
                 "Mistral Large 4 specialized decode caches unsupported: "

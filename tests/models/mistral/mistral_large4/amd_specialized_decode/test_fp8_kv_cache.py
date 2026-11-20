@@ -2,15 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU tests of the Mistral Large 4 specialized decode on an fp8 latent KV cache.
 
-One TP4 rank's shard of one MoE layer per kind runs on a single GPU through
-`Ml4MonoKernel` (npes=1), with random weights, a randomly paged cache and one
-DSpark verify step of 4 rows whose last row is padding (slot -1: KV-sharing
-layers used to load it ~4 GiB past the source cache, a GPU memory fault).
+One rank's shard of one MoE layer per kind (TP4 on gfx950, TP8 on gfx942) runs
+on a single GPU through `Ml4MonoKernel` (npes=1), with random weights, a
+randomly paged cache and one DSpark verify step of 4 rows whose last row is
+padding (slot -1: KV-sharing layers used to load it ~4 GiB past the source
+cache, a GPU memory fault).
 
 The cache holds the same content as bf16 and as fp8 (written by vLLM's fp8
 cache writer, which fills it on every non-mono step). KV-sharing layers never
 write the cache, so their outputs match exactly; the other layers must store
-what vLLM's writer stores for the bf16 rows, saturating at +-448.
+what vLLM's writer stores for the bf16 rows, saturating at the largest finite
+fp8 value (448, or 240 for gfx942's E4M3FNUZ).
 """
 
 import functools
@@ -20,23 +22,29 @@ import torch
 
 from vllm.platforms import current_platform
 
-FP8 = torch.float8_e4m3fn
-HIDDEN, NH, KVL, PE, VD, E = 6144, 16, 512, 64, 128, 128
+
+def _kernel_arch() -> str | None:
+    """The architecture the ML4 mono kernels build for here, if any."""
+    if not current_platform.is_rocm():
+        return None
+    from vllm.platforms.rocm import on_gfx942, on_gfx950
+
+    return "gfx950" if on_gfx950() else "gfx942" if on_gfx942() else None
+
+
+ARCH = _kernel_arch()
+GFX942 = ARCH == "gfx942"
+pytestmark = pytest.mark.skipif(
+    ARCH is None,
+    reason="the ML4 mono kernels need gfx950 (MI355X) or gfx942 (MI300X / MI325X)",
+)
+
+FP8 = torch.float8_e4m3fnuz if GFX942 else torch.float8_e4m3fn
+FP8_MAX = torch.finfo(FP8).max
+TP = 8 if GFX942 else 4
+HIDDEN, KVL, PE, VD, E = 6144, 512, 64, 128, 128
 QK = KVL + PE
 PAGE, PAGES, S, POS0, TOPK = 64, 64, 4, 3000, 2048
-
-
-def _on_gfx950() -> bool:
-    if not current_platform.is_rocm():
-        return False
-    from vllm.platforms.rocm import on_gfx950
-
-    return on_gfx950()
-
-
-pytestmark = pytest.mark.skipif(
-    not _on_gfx950(), reason="the ML4 mono kernels need gfx950 (MI355X)"
-)
 
 
 def _randn(*shape, scale=1.0):
@@ -49,13 +57,6 @@ def build_layer(kind: str):
     `runtime.weights.build_moe_layer` packs a loaded one."""
     from types import SimpleNamespace as NS
 
-    from aiter.utility.fp4_utils import e8m0_shuffle
-
-    from vllm._aiter_ops import rocm_aiter_ops
-    from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.weights.config import (  # noqa: E501
-        Mxfp4ScaleLayout,
-        Mxfp4WeightLayout,
-    )
     from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.weights.layer import (  # noqa: E501
         LayerWeights,
     )
@@ -70,7 +71,8 @@ def build_layer(kind: str):
     q128 = weights._q128
     nope_layer, kv_share, _ = weights.KINDS[kind]
     v = load_variant(nope_layer, kv_share)
-    C = v.geometry_config.ml4_tp_config(4)
+    C = v.geometry_config.ml4_tp_config(TP)
+    NH = C.local_heads
     bf, f32 = torch.bfloat16, torch.float32
     t = {}
     t["w_q_b"], t["s_q_b"] = q128(_randn(NH * 128, HIDDEN, scale=HIDDEN**-0.5))
@@ -99,8 +101,53 @@ def build_layer(kind: str):
     t["w_index_w"] = kw[idim:].to(bf).contiguous()
     t["g_index_k"] = torch.ones(idim, dtype=f32, device="cuda")
     t["b_index_k"] = torch.zeros(idim, dtype=f32, device="cuda")
-    # routed experts: random MXFP4 values / E8M0 scales in vLLM's AITER a4w4
-    # storage (the kernels' ATOM layout); their content is irrelevant here
+    layouts = _routed_experts_fp8(t, C, q128) if GFX942 else _routed_experts_mxfp4(t, C)
+    t["w_ug"].is_shuffled = t["w_dn"].is_shuffled = True
+    # shared expert: block fp8, read in place on gfx942 and re-quantized to
+    # MXFP4 on gfx950, as the runtime does
+    linear = lambda n, k: NS(  # noqa: E731
+        **dict(zip(("weight", "weight_scale_inv"), q128(_randn(n, k, scale=k**-0.5))))
+    )
+    shared = NS(
+        gate_up_proj=linear(2 * C.inter, HIDDEN), down_proj=linear(HIDDEN, C.inter)
+    )
+    shared_expert = (
+        weights._shared_expert_fp8 if GFX942 else weights._shared_expert_mxfp4
+    )
+    t.update(shared_expert(shared))
+    W = LayerWeights(NH, t, C, 0, 1, physical_experts=E, **layouts)
+    return v, W
+
+
+def _routed_experts_fp8(t, C, q128) -> dict:
+    """Random block-FP8 routed experts in AITER's shuffled MoE storage, which
+    the gfx942 kernels read in place."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    w13, s13 = zip(
+        *(q128(_randn(2 * C.inter, HIDDEN, scale=HIDDEN**-0.5)) for _ in range(E))
+    )
+    w2, s2 = zip(
+        *(q128(_randn(HIDDEN, C.inter, scale=C.inter**-0.5)) for _ in range(E))
+    )
+    t["w_ug"], t["w_dn"] = rocm_aiter_ops.shuffle_weights(
+        torch.stack(w13), torch.stack(w2)
+    )
+    t["s_ug"], t["s_dn"] = torch.stack(s13).contiguous(), torch.stack(s2).contiguous()
+    return {}
+
+
+def _routed_experts_mxfp4(t, C) -> dict:
+    """Random MXFP4 values / E8M0 scales in vLLM's AITER a4w4 storage (the
+    gfx950 kernels' ATOM layout); their content is irrelevant here."""
+    from aiter.utility.fp4_utils import e8m0_shuffle
+
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.weights.config import (  # noqa: E501
+        Mxfp4ScaleLayout,
+        Mxfp4WeightLayout,
+    )
+
     u8 = torch.uint8
     for w, s, rows, cols in (("w_ug", "s_ug", 2 * C.inter, HIDDEN),
                              ("w_dn", "s_dn", HIDDEN, C.inter)):  # fmt: skip
@@ -113,22 +160,10 @@ def build_layer(kind: str):
     fp4 = torch.float4_e2m1fn_x2
     w13, w2 = rocm_aiter_ops.shuffle_weights(t["w_ug"].view(fp4), t["w_dn"].view(fp4))
     t["w_ug"], t["w_dn"] = w13.view(u8), w2.view(u8)
-    t["w_ug"].is_shuffled = t["w_dn"].is_shuffled = True
-    # shared expert: block fp8, re-quantized to MXFP4 as the runtime does
-    linear = lambda n, k: NS(  # noqa: E731
-        **dict(zip(("weight", "weight_scale_inv"), q128(_randn(n, k, scale=k**-0.5))))
-    )
-    shared = NS(
-        gate_up_proj=linear(2 * C.inter, HIDDEN), down_proj=linear(HIDDEN, C.inter)
-    )
-    t.update(weights._shared_expert_mxfp4(shared))
-    W = LayerWeights(
-        NH, t, C, 0, 1,
+    return dict(
         mxfp4_weight_layout=Mxfp4WeightLayout.ATOM,
         mxfp4_scale_layout=Mxfp4ScaleLayout.ATOM,
-        physical_experts=E,
-    )  # fmt: skip
-    return v, W
+    )
 
 
 def vllm_fp8_rows(rows: torch.Tensor) -> torch.Tensor:
@@ -176,7 +211,7 @@ def run_layer(kind, kv_cache_dtype, kv, index_cache, step, W=None):
         index_page_size=PAGE, index_block_table_stride=PAGES,
         index_cache_dtype="fp8", attention_weight="fp8_block128",
         kv_cache_layout="atom", kv_cache_dtype=kv_cache_dtype,
-        native_fp4_mfma=True, rope_dtype="fp32", separate_shared=True,
+        native_fp4_mfma=not GFX942, rope_dtype="fp32", separate_shared=True,
     )  # fmt: skip
     try:
         out = kernel.forward(
@@ -227,16 +262,16 @@ def test_fp8_cache_matches_bf16(kind, history_scale):
 @pytest.mark.parametrize("kind", ("rope", "nope"))
 @torch.inference_mode()
 def test_fp8_cache_saturates(kind):
-    """Latent and rope key values beyond +-448 saturate, as vLLM's writer does,
-    instead of becoming NaN."""
+    """Latent and rope key values beyond the largest finite fp8 value saturate,
+    as vLLM's writer does, instead of becoming NaN."""
     from dataclasses import replace
 
     _, W = build_layer(kind)
     t = dict(W.t, g_kv=W.t["g_kv"] * 1000, s_qkv_a=W.t["s_qkv_a"] * 1000)
     _, _, kv_bf, kv_f8, _, slots = run_both(kind, W=replace(W, t=t))
     new_bf, new_f8 = kv_bf[slots], kv_f8[slots]
-    assert (new_bf[:, :KVL].float().abs() > 448).any()
-    assert (new_bf[:, KVL:].float().abs() > 448).any() == (kind == "rope")
+    assert (new_bf[:, :KVL].float().abs() > FP8_MAX).any()
+    assert (new_bf[:, KVL:].float().abs() > FP8_MAX).any() == (kind == "rope")
     assert not torch.isnan(new_f8.float()).any()
     assert torch.equal(
         new_f8.view(torch.uint8), vllm_fp8_rows(new_bf).view(torch.uint8)

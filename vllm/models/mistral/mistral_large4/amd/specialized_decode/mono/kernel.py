@@ -34,7 +34,7 @@ one memory round trip: no store drain, no separate flag, no second load.
 
 GEMVs run on the matrix cores: weights are host-packed (`pack_fp8` /
 `pack_bf16`) so one wave loads 16 rows x 64 k as one contiguous 1 KB, FP8 is
-widened exactly to bf16 and fed to `mfma_f32_16x16x32_bf16` with the samples
+widened exactly to bf16 and fed to a 16x16x32 bf16 MFMA (`mfma_bf16`) with the samples
 as the N dimension.  Each 64-k chunk's partial is scaled by its f32 block
 scale (times any activation scale / route weight) into the accumulator, so the
 math is exact block-scaled FP8 on bf16 activations.  Weight loads that do not
@@ -58,15 +58,23 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.arch import (
+    GFX942,
+)
 from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.ops import (
     bpermute_i32,
     div_rn,
     f8_word,
     fp8_pack4,
+    global_load,
     mem_realtime,
     memrealtime,
+    mfma_f8f8_k128,
+    mul_unpacked,
+    popcount,
     read_lane_i32,
     spin_pause,
+    wave_or_dpp,
     wave_umax_dpp,
     write_lane_i32,
 )
@@ -78,6 +86,9 @@ from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.devic
 )
 from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.ops import (
     fp8_to_bf16x8 as _fp8_to_bf16x8,
+)
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.ops import (
+    mfma_bf16 as _mfma_bf16,
 )
 from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.ops import (
     mxfp4_to_bf16x8 as _mxfp4_to_bf16x8,
@@ -121,6 +132,7 @@ from .geometry_config import (
     EPS,
     FP8_MAX,
     HIDDEN,
+    INDEX_FP8_MAX,
     INDEX_ROPE,
     INTER,
     KV_LORA,
@@ -174,6 +186,7 @@ from .layout import (
     XQ_BLOCKS,
     XQ_GROUPS,
     XQ_WAVES,
+    cache_per_row,
     dcp_local_uv_tile,
     dcp_summary_index,
     dcp_uv_owner,
@@ -196,6 +209,8 @@ from .layout import (
     indexer_uses_tiles,
     layout,
     ptpc_stage_chunk,
+    qkv_index_tasks,
+    qkv_sample_tiles,
     sample_wave_batches,
     sparse_keys_per_task,
     split_acc_head,
@@ -203,6 +218,11 @@ from .layout import (
     stage_tasks,
     ug_split,
 )
+
+# The index K writer's scale is 2 ** (exponent(amax) - INDEX_FP8_EXP), plus
+# one above a 1.75 mantissa: INDEX_FP8_MAX = 1.75 * 2 ** INDEX_FP8_EXP.
+INDEX_FP8_EXP = round(math.log2(INDEX_FP8_MAX / 1.75))
+assert INDEX_FP8_MAX == 1.75 * 2**INDEX_FP8_EXP
 
 # ------------------------------------------------- selection tree, per token
 # ``layout``'s ``index_lists``/``index_levels`` size the tree a BUILD carries;
@@ -276,6 +296,11 @@ def build_ml4_monokernel(
     index_cache_dtype: str = "bf16",
     expert_mxfp4: bool = False,
     atom_experts: bool = False,
+    # FP8 experts read in place from aiter's block-scale MoE storage
+    # (`shuffle_weight` 16x16: a 64-k chunk holds k 16 (lane // 16) .. + 16 of
+    # row lane % 16 in each lane), so the FP8 activations sit in LDS in natural
+    # K order instead of `f8_word` order.
+    aiter_fp8_experts: bool = False,
     attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
     kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
     kv_cache_dtype: str = "bf16",
@@ -310,6 +335,12 @@ def build_ml4_monokernel(
     split_head_merge: bool = True,
     ug_prefetch: int = 1,
     qkv_sample_tile: int = 6,
+    # Each row's key count from its own position and slot (the whole context
+    # up to top-k, none for a padded row), so the caller need not build
+    # `sparse_kv_indptr`: the fused-indexer and index-sharing paths read their
+    # top-k at a fixed row stride and use no cumulative bounds. None:
+    # ``MONO_OWN_KEYS=1``.
+    own_key_counts: bool | None = None,
 ):
     """Return the `@flyc.jit` launcher for one rank's whole layer.
 
@@ -328,12 +359,26 @@ def build_ml4_monokernel(
     attention_bf16 = attention_weight is AttentionWeight.BF16
     attention_ptpc = attention_weight is AttentionWeight.FP8_PTPC
     use_atom_kv_cache = cache_layout is KvCacheLayout.ATOM
+    if own_key_counts is None:
+        own_key_counts = os.environ.get("MONO_OWN_KEYS", "0") == "1"
+    if own_key_counts and not (use_atom_kv_cache and (with_indexer or shared_indices)):
+        raise ValueError(
+            "own_key_counts needs the ATOM cache and fixed-stride top-k "
+            "(fused indexer or shared indices)"
+        )
+    CACHE_TASKS = S if cache_per_row() else 1
+    N_QKV_IDX = qkv_index_tasks(with_indexer)
+    QKV_TILES = qkv_sample_tiles(S)
     cache_fp8 = kv_cache_dtype == "fp8"
     # ATOM's production index plane; "bf16" is the private plane PR #1256 wrote.
     index_fp8 = index_cache_dtype == "fp8"
     assert not cache_fp8 or use_atom_kv_cache
     assert not atom_experts or expert_mxfp4
     assert not native_fp4_mfma or atom_experts
+    assert not aiter_fp8_experts or not expert_mxfp4
+    assert not GFX942 or not expert_mxfp4, (
+        "MXFP4 experts need gfx950's scaled conversions and MFMA"
+    )
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
     SPLIT_KEYS = sparse_keys_per_task(S, heads)
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 12
@@ -403,13 +448,36 @@ def build_ml4_monokernel(
     SHARD_INDEX_Q = indexer_cp and not TILED_INDEXER and W > 1
     CP_PARTS = index_cp_partitions(index_max_seq, CP_RANKS) if TILED_INDEXER else 0
     N_SPLIT = topk // SPLIT_KEYS
+    N_HEAD_GROUPS = H // WAVES
+    # ---- the merged head groups (``split_head_merge``)
+    # ``gather_old_kv`` copies the (sample, key-chunk) KV rows into LDS and
+    # closes over nothing else: no ``head_group``, no ``h``. The two tasks
+    # that share an (s, t) and differ only in head group therefore issue
+    # byte-identical gathers -- 384 of the 768 at S=12, each 64 keys x
+    # (KV_LORA + PE_DIM) bytes. The q wait above it is duplicated for the
+    # same reason, and it already waits on all H heads, not this group's.
+    # So let one task own both groups and run them BACK TO BACK.
+    #
+    # Sequential, not simultaneous, and that is the whole feasibility
+    # argument: the PV accumulators are local to a group's body, ``red`` is
+    # rewritten under a barrier, and ``pl`` is already sized for all H
+    # heads. Nothing has to be live across the two, so the register
+    # pressure does not double -- which it would if the groups were
+    # interleaved, and this kernel has no room (239 of 256 VGPRs at S=12).
+    #
+    # Bit-identical outright: no value, order or rounding moves, only which
+    # task computes it. The q staging goes back to covering all H heads at
+    # once, which is what ``QHEADS`` narrows per group -- once over H here
+    # costs exactly what twice over H/2 cost before.
+    SPLIT_MERGE = bool(split_head_merge) and N_HEAD_GROUPS > 1
+    SPLIT_GROUPS = N_HEAD_GROUPS if SPLIT_MERGE else 1
+    N_SPLIT_TASKS = S * (N_HEAD_GROUPS // SPLIT_GROUPS) * N_SPLIT
     QB_ROWS = H * (NOPE_DIM + Q_PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
-    # The index-Q row space is fixed at 256 tiles.  TP8 produces half from
-    # q_b CTAs; TP4 produces all of them, one per CTA.
-    assert not with_indexer or (
-        INDEX_Q_ROWS // INDEX_TILE == BLOCKS and N_QB in (BLOCKS // 2, BLOCKS)
-    )
+    # The index-Q row space is fixed at 256 tiles, one per CTA: the q_b CTAs
+    # produce the first N_QB (TP4: all of them, TP8: a quarter), the others
+    # the rest.
+    assert not with_indexer or (INDEX_Q_ROWS // INDEX_TILE == BLOCKS and N_QB <= BLOCKS)
     QB_PER_HEAD = (NOPE_DIM + Q_PE_DIM) // Q_B_TILE
     N_UK = H * KV_LORA // UK_TILE
     UK_PER_HEAD = KV_LORA // UK_TILE
@@ -438,7 +506,16 @@ def build_ml4_monokernel(
     # 16 N columns and uses 4 of them. Raising the tile trades LDS for weight
     # traffic; it is bit-identical, because the samples are independent output
     # columns and each one's K chunks accumulate in the same order either way.
-    SAMPLE_TILE = min(S, qkv_sample_tile)
+    # gfx942: four 6144-wide bf16 rows (48 KB) is all its 64 KB of LDS holds
+    # next to the reductions, so wider steps also stage the q_b and index_q
+    # input four samples at a time (``X_TILE``), over the same weight registers.
+    SAMPLE_TILE = min(S, 4 if GFX942 else qkv_sample_tile)
+    X_TILE = SAMPLE_TILE if GFX942 else S
+    # A q_b / index_q step wider than X_TILE stages its input tile by tile;
+    # each tile's poll loads (one batch a thread) go out under the previous
+    # tile's MFMA chain and reduction instead of after them.
+    _X_TILE_PRE = GFX942 and X_TILE < S and X_TILE * HIDDEN // 4 // THREADS <= POLL_MAX
+    assert not (attention_ptpc and X_TILE < S)
     # Per-sample strides of the MoE FP8 activation tile and its block scales,
     # in LDS.  ``HIDDEN // 4`` (1536) and ``XQ_GROUPS`` (192) are both multiples
     # of the 32 LDS banks, so when the up/gate MFMA's B column is the SAMPLE --
@@ -484,6 +561,148 @@ def build_ml4_monokernel(
     # in the up/gate stage, for an in-process A/B. Both are bit-identical; see
     # ``atom_mxfp4_scale_pair`` and the comment in ``ug8_units``.
     _UG_SCALE_PAIR = not _R2_OFF and os.environ.get("MONO_UG_SCALE_PAIR", "1") == "1"
+    # When the up/gate tasks do not fill whole CTA sweeps (TP8: 384 over 256),
+    # the first ``UG_TASKS % G`` CTAs of the rotation run one task more. Task u
+    # runs logical task ``(u + UG_SHIFT) % UG_TASKS``, which puts the ``inter/8``
+    # tasks that also carry the shared expert on CTAs with one task fewer.
+    # Only the task-to-CTA assignment moves.
+    _UG_TASKS = TOP_K * (expert_inter // 8)
+    _UG_EXTRA = _UG_TASKS % G
+    UG_SHIFT = (
+        _UG_TASKS - _UG_EXTRA
+        if not moe_dedup and _UG_EXTRA and _UG_EXTRA + expert_inter // 8 <= G
+        else 0
+    )
+    # S=1 with more up/gate tasks than CTAs: a CTA stages and routes its
+    # activation once for all of its tasks and keeps every task's routed weight
+    # tile in flight together, instead of one full round per task.
+    # Bit-identical: each task's loads, MFMAs and sums are unchanged.
+    _UG1_FUSE = GFX942 and not expert_mxfp4
+    # A row whose context is at most ``topk`` keys selects every key, so its
+    # sparse attention reads the keys by position: the index query, scores and
+    # selection are skipped and ``split`` no longer waits on them (the shared-
+    # index layers apply the same rule). The index-K cache write is unchanged.
+    _DENSE_SHORT = GFX942
+    # A unit's coefficient is applied with a multiply the SLP vectorizer cannot
+    # pack (`mul_unpacked`). Packed, its broadcast operand made the waitcnt pass
+    # wait on a pending scale load of a later unit, draining the weight prefetch
+    # (S = 8 `down`: four full drains in the routed stream's tail). Same products
+    # for finite values.
+    _SCALAR_COEF = GFX942
+    # `down` quantizes a wave's mid blocks with their max reductions
+    # interleaved (`quant_scaled_many`), not one block's after another.
+    _DN_QUANT_BATCH = GFX942
+    # `down` quantizes each 128-block of the mid once -- block k on the CTA of
+    # down tile k (mod N_DN_TILES) -- and publishes it as FP8 words and a
+    # scale that every CTA copies into LDS. Each CTA used to quantize all
+    # S * MOE_SLOTS * inter / 128 blocks itself: 30 a wave at S = 8, ~4 us of
+    # VALU (4 cycles a wave64 op) between the last mid and the first MFMA.
+    _DN_MID8 = _DN_QUANT_BATCH and not expert_mxfp4 and S > 1
+    # FP8 block amax as one DPP max chain read back from lane 63. The operands
+    # are |x|, whose bits order like unsigned ints, so `wave_umax_dpp` picks
+    # the same maximum as the float butterfly -- whose 32 / 16 steps are LDS
+    # permutes on gfx942, and LLVM serialises them: the S = 8 `down` quant of
+    # 30 blocks a wave took 4-6 us.
+    _QUANT_DPP = GFX942
+    # Float max / min without NaN propagation: gfx942 has no IEEE maximum, so
+    # each one is a max, an ordered compare and a select. The operands are FP8
+    # quant |x| and x * inv against +-FP8_MAX, softmax and router maxima over
+    # finite logits (or -1e30 fill), |x| maxima, clamps, and the index ReLU on
+    # MFMA sums (never -0: the accumulator starts at +0), where signed zeros
+    # cannot change the result; finite inputs give the same bits.
+    _MAX_FM = "nnan,nsz" if GFX942 else None
+    # timeline stamps only in these stages (comma list); the rest build as without.
+    # A tuple, not a list: the JIT cache key takes scalar and tuple closure values.
+    _TL_ONLY = tuple(s for s in os.environ.get("MONO_TL_ONLY", "").split(",") if s)
+    # and only these columns (comma list of ints), e.g. 0,4 for start and end
+    _TL_COLS = tuple(int(c) for c in os.environ.get("MONO_TL_COLS", "").split(",") if c)
+    # A split past its row's last key (a dense row shorter than ``topk``)
+    # holds no keys: it is skipped, and the merge reads only the splits that
+    # hold keys. A skipped split's weight exp(NEG - M) / L is exactly 0, so
+    # its partial sum never contributed. Split 0 always runs (it publishes a
+    # padded row's empty softmax).
+    #
+    # Split tasks run in row-major (sample, head group, split) order, so a
+    # CTA's task one round later is the same split of a later row. Odd rounds
+    # then walk the splits in reverse (`split_coords`): a short row's live
+    # splits are the low ones, and a CTA pairs a low split with a high one
+    # instead of two live ones while other CTAs get two empty ones. Each
+    # (sample, split) computes the same: bit-identical.
+    _SKIP_EMPTY_SPLITS = GFX942 and D == 1
+    # A split task's row bounds, and -- in a dense row, its keys positions
+    # t * SPLIT_KEYS.. on one page -- the page of its keys (and page 0, a dead
+    # key's), depend on launch inputs alone: each CTA loads them for its split
+    # rounds at kernel start, with the rows' cache slots `patch_new_kv`
+    # matches, as one word per lane. The split then waits on the KV gather
+    # only, not on two round trips before it.
+    _SPLIT_PRE = (
+        _SKIP_EMPTY_SPLITS
+        and use_atom_kv_cache
+        and (with_indexer or shared_indices)
+        and index_page_size % SPLIT_KEYS == 0
+        and (N_SPLIT_TASKS + G - 1) // G <= 8
+    )
+    # A split's KV gather issues all of a wave's key row loads before it waits
+    # on any (`gather_old_kv_batched`); at S <= 2 that measured slower.
+    _GATHER_BATCH = GFX942 and S > 2
+    # A split wave holding rows of this launch polls all their kvnew / penew
+    # pairs at once (`patch_new_kv_batched`); at S = 1 (one new key at most)
+    # that measured slower.
+    _PATCH_BATCH = GFX942 and S > 1
+    # A split's QK reads each K step's LDS operands during the previous
+    # step's MFMAs, not after them.
+    _QK_PIPE = GFX942
+    # The four W_UV tasks of a head (UV_TILE = 32) each merge one latent
+    # quarter of the splits' partial sums, publish it (`lat`) and gather the
+    # other three, instead of each merging the whole latent: a merge pulls a
+    # quarter of the bytes through the (L2-bypassing) coherent loads, which
+    # bound it.
+    _UV_SLICE = (
+        GFX942 and D == 1 and not attention_ptpc and UV_TILE * KV_LORA == V_DIM * 128
+    )
+    # The shared expert's four weight pointers are read from the parameter
+    # table once, ahead of the MoE, instead of next to each use. Measured
+    # (same-GPU ABBA): -1.1 us at S = 2, but +0.5 us at S = 1 and +1.6 us at
+    # S = 4, so it is on at S = 2 only.
+    _HOIST_SHARED = GFX942 and S == 2
+    # `down` reuses the routing table `ug` left in LDS instead of polling the
+    # scores again and re-running the top-k: at S > 1 `ug` starts with
+    # `dn_route` itself, and the fused S = 1 path writes the same table from
+    # its own picks. The re-route cost ~3.5 us on the CTAs that finish `ug`
+    # last, which is where `down`'s critical path starts.
+    _DN_ROUTE_REUSE = GFX942 and (
+        S > 1 or (_UG1_FUSE and TOP_K * (expert_inter // 8) > BLOCKS)
+    )
+    # S > 1 up/gate as one flat task list (shared-expert units first, then
+    # every sample's routed units) striped over the CTAs with a one-unit
+    # prefetch across task boundaries, instead of per-sample rounds that each
+    # restart the weight pipeline. -0.5 us at S = 2, even at S = 4;
+    # bit-identical.
+    _UG_FLAT = GFX942 and not expert_mxfp4 and not moe_dedup and not atom_experts
+    # The flat list's shared-expert units (one per CTA, on the first
+    # expert_inter // 8 CTAs of the rotation) need no routing: those CTAs run
+    # theirs while the router is still busy, before `dn_route`, so the
+    # routed units -- a whole number of rounds at even S -- are all that is
+    # left once the scores land. Otherwise the shared CTAs carry one unit
+    # more than the rest, which streams as a partly empty last round.
+    _UG_SH_EARLY = _UG_FLAT and expert_inter // 8 <= G
+    # The flat list's routed units name each DISTINCT expert once, with every
+    # sample in the MFMA's N columns as the shared unit has them, and a sample
+    # keeps the columns of the experts it routes to. A column's value does not
+    # depend on the others, so this is bit-identical. The L2 / MALL already
+    # serve most repeated tiles; what it saves is the rest of a repeat's cost.
+    # Measured with GSM8K-like overlap (22 distinct experts in 32 picks at
+    # S = 8, 13 in 16 at S = 4): -7.7 us at S = 8 on one GPU, -6.7 at TP8;
+    # nothing at S = 4, and +1.5 us at S = 8 with no overlap (one GPU). On at
+    # S >= 8.
+    _UG_DEDUP = _UG_SH_EARLY and S >= 8
+    # Streams that carry only routed picks (the flat up/gate list past the
+    # shared units, `down` once `DN_SHARED` hoists slot 0 out) address their
+    # experts without the separate shared expert's select (`expert_addr`), so
+    # a tile's loads go out while the previous tile's are still in flight.
+    # Measured at TP8: -2.3 us at S = 8, but +0.4 at S = 2 (-0.7 on one GPU);
+    # +1.1 / +0.8 at S = 4 on one GPU. On at S >= 8.
+    _ROUTED_ADDR = GFX942 and S >= 8
     QHEADS = (
         WAVES
         if (
@@ -509,7 +728,7 @@ def build_ml4_monokernel(
     )
     X_WORDS = max(
         SAMPLE_TILE * HIDDEN // 2,
-        S
+        X_TILE
         * HIDDEN
         // 2,  # ML4: q_b and index_q stage the full normed hidden (no q-LoRA)
         S * XQ_X_STRIDE,
@@ -546,6 +765,8 @@ def build_ml4_monokernel(
     UG_GROUP_WORDS = (
         UG_ROUTED * (2 + 2 * UG_MASK_WORDS) + 1 if moe_dedup and S > 1 else 0
     )
+    if _UG_DEDUP:  # `ug_flat`'s group -> expert map
+        UG_GROUP_WORDS = UG_ROUTED
     GRP_OFF = OUT_OFF + OUT_WORDS
     WORK_WORDS = GRP_OFF + UG_GROUP_WORDS
     # 40960 words = 163,840 B, which is what the device reports as usable:
@@ -567,10 +788,12 @@ def build_ml4_monokernel(
     # not in that tuple, so the overrun used to take the engine down instead --
     # and `fused_indexer_refusal` has no width check to catch it earlier, so
     # the fused path at an unsupported width was a crash, not a fallback.
-    if WORK_WORDS > 40960:
+    # gfx942 has 64 KB of LDS a CU.
+    LDS_WORDS = 16384 if GFX942 else 40960
+    if WORK_WORDS > LDS_WORDS:
         raise ValueError(
-            f"static LDS {WORK_WORDS * 4} B exceeds the gfx950 per-workgroup "
-            f"budget of 163840 B at S={S}"
+            f"static LDS {WORK_WORDS * 4} B exceeds the per-workgroup budget "
+            f"of {LDS_WORDS * 4} B at S={S}"
         )
 
     base, first, acc = {}, {}, 0
@@ -754,8 +977,14 @@ def build_ml4_monokernel(
                 fx.BFloat16(bo.buffer_load(r, i, vec_width=1, dtype=T.bf16))
             )
 
+        def fmax(a, b):
+            return fx.max(a, b, fastmath=_MAX_FM)
+
+        def fmin(a, b):
+            return fx.min(a, b, fastmath=_MAX_FM)
+
         def _fp8_sat(x):
-            return fx.min(fx.max(x, -FP8_MAX), FP8_MAX)
+            return fmin(fmax(x, -FP8_MAX), FP8_MAX)
 
         def ld_fp8_pair(r, i):
             """E4M3 bytes `2 * i` and `2 * i + 1` of `r` (exact, scale 1) as f32."""
@@ -778,36 +1007,92 @@ def build_ml4_monokernel(
                 return ld_bf16(r, i)
             return ld_f32(r, i)
 
-        def row_index_bounds(s):
-            begin = fx.Int32(
-                bo.buffer_load(_rsrc(sparse_kv_indptr), s, vec_width=1, dtype=T.i32)
-            )
-            end = fx.Int32(
-                bo.buffer_load(_rsrc(sparse_kv_indptr), s + 1, vec_width=1, dtype=T.i32)
-            )
-            return begin, end
+        # Row k's word of a per-row launch input (positions and the slot
+        # mapping are int64: every other word), or with ``pre`` its copy in
+        # lane PRE_TABLES.index(name) * 16 + k of ``row_pre`` (`_SPLIT_PRE`;
+        # k uniform).
+        PRE_TABLES = ("positions", "slot_mapping", "indptr", "pages")
 
-        def row_active(s):
+        def ld_row(name, k, pre=False):
+            if const_expr(pre):
+                return read_lane_i32(row_pre, PRE_TABLES.index(name) * 16 + k)
+            t, stride = {
+                "positions": (positions, 2),
+                "slot_mapping": (slot_mapping, 2),
+                "indptr": (sparse_kv_indptr, 1),
+            }[name]
+            return fx.Int32(
+                bo.buffer_load(_rsrc(t), k * stride, vec_width=1, dtype=T.i32)
+            )
+
+        def row_index_bounds(s, pre=False):
+            if const_expr(own_key_counts):
+                position = ld_row("positions", s, pre)
+                count = (row_slot(s, pre) >= 0).select(
+                    fx.min(position + 1, fx.Int32(topk)), fx.Int32(0)
+                )
+                return fx.Int32(0), count
+            return ld_row("indptr", s, pre), ld_row("indptr", s + 1, pre)
+
+        def row_active(s, pre=False):
             if const_expr(use_atom_kv_cache):
-                begin, end = row_index_bounds(s)
+                begin, end = row_index_bounds(s, pre)
                 return end > begin
             return True
 
-        def row_position(s):
+        def row_position(s, pre=False):
             if const_expr(use_atom_kv_cache):
-                position = fx.Int32(
-                    bo.buffer_load(_rsrc(positions), s * 2, vec_width=1, dtype=T.i32)
-                )
-                present = row_active(s) | (row_slot(s) >= 0)
+                position = ld_row("positions", s, pre)
+                present = row_active(s, pre) | (row_slot(s, pre) >= 0)
                 return present.select(position, fx.Int32(0))
             return pos0 + s
 
-        def row_slot(s):
+        def long_row(s, pre=False):
+            """Row s has more than ``topk`` keys, so its top-k is a real selection."""
+            if const_expr(not _DENSE_SHORT):
+                return fx.Boolean(True)
+            return row_position(s, pre) + 1 > topk
+
+        def any_long_row():
+            any_long = long_row(0)
+            for s in range_constexpr(1, S):
+                any_long = any_long | long_row(s)
+            return any_long
+
+        def row_slot(s, pre=False):
             if const_expr(use_atom_kv_cache):
-                return fx.Int32(
-                    bo.buffer_load(_rsrc(slot_mapping), s * 2, vec_width=1, dtype=T.i32)
-                )
+                return ld_row("slot_mapping", s, pre)
             return pos0 + s
+
+        def split_rows(s, pre=False):
+            """(nkeys, sparse, use_indices, index_base) of sample s: loads only."""
+            if const_expr(use_atom_kv_cache):
+                index_base, index_end = row_index_bounds(s, pre)
+                nkeys = index_end - index_base
+                sparse = index_end > index_base
+            else:
+                index_base = s * topk
+                kv_len = pos0 + s + 1
+                sparse = kv_len > topk
+                nkeys = sparse.select(fx.Int32(topk), kv_len)
+            # read the selected indices, not the keys in position order
+            use_indices = (
+                sparse & long_row(s, pre) if const_expr(_DENSE_SHORT) else sparse
+            )
+            return nkeys, sparse, use_indices, index_base
+
+        def split_coords(tt):
+            """(sample, first head group, split) of split task tt."""
+            if const_expr(SPLIT_MERGE):
+                s = tt // N_SPLIT
+                hg0 = fx.Int32(0)
+            else:
+                s = tt // (N_HEAD_GROUPS * N_SPLIT)
+                hg0 = (tt // N_SPLIT) % N_HEAD_GROUPS
+            t = tt % N_SPLIT
+            if const_expr(_SKIP_EMPTY_SPLITS):  # odd rounds in reverse
+                t = ((tt // G) % 2 == 1).select(fx.Int32(N_SPLIT - 1) - t, t)
+            return s, hg0, t
 
         def row_writes_cache(s):
             return row_slot(s) >= 0
@@ -875,12 +1160,35 @@ def build_ml4_monokernel(
                 fx.Uint32(_uniform(pv[0]))
             )
 
-        def expert_addr(base, e, stride, which):
-            """Address of expert `e` in one expert tensor (`which`: 0 w_ug, 1 s_ug, 2 w_dn, 3 s_dn)."""
+        shared_ptrs = {}
+
+        def shared_ptr(which):
+            """The separate shared expert's tensor `which` (see `expert_addr`)."""
+            got = shared_ptrs.get(which)
+            if const_expr(got is None):
+                return index_arg(SHARED_EXPERT_ARGS + which)
+            return got
+
+        def hoist_shared_ptrs():
+            """Read the shared expert's pointers once, ahead of the MoE weight
+            streams. `vmcnt` retires in order, so a param-table load issued behind
+            in-flight weight tiles waits for all of them before its address is
+            usable, and the next tile's loads cannot be issued ahead of time."""
+            if const_expr(separate_shared and _HOIST_SHARED):
+                for which in range_constexpr(4):
+                    shared_ptrs[which] = index_arg(SHARED_EXPERT_ARGS + which)
+
+        def expert_addr(base, e, stride, which, routed_only=False):
+            """Address of expert `e` in one expert tensor (`which`: 0 w_ug, 1 s_ug, 2 w_dn, 3 s_dn).
+
+            `routed_only`: `e` is a routed pick, never the separate shared
+            expert, whose pointer is a param-table load. `vmcnt` retires in
+            order, so that load (selected away or not) waits for every weight
+            tile in flight, and the next tile's loads issue only after it."""
             routed = base + fx.Int64(e) * fx.Int64(stride)
-            if const_expr(separate_shared):
+            if const_expr(separate_shared and not routed_only):
                 return (fx.Int32(e) == fx.Int32(SHARED_EXPERT)).select(
-                    index_arg(SHARED_EXPERT_ARGS + which), routed
+                    shared_ptr(which), routed
                 )
             return routed
 
@@ -970,7 +1278,25 @@ def build_ml4_monokernel(
                 _qptr(addr), memory_order=fx.AtomicOrdering.Monotonic, syncscope=scope
             )
 
-        def poll(specs, scope="agent", batch=POLL_MAX):
+        def poll_issue(specs, scope="agent"):
+            """`poll`'s first loads of `specs` (at most POLL_MAX), issued now and
+            waited for by ``poll(specs, first=...)``."""
+            cm = CM_DEV if const_expr(scope == "agent") else CM_SYS
+            words = []
+            for b, i, n in specs:
+                w = fx.Vector(
+                    bo.buffer_load(
+                        _rsrc(b),
+                        fx.Int32(i) * 2,
+                        vec_width=2 * n,
+                        dtype=T.i32,
+                        cache_modifier=cm,
+                    )
+                )
+                words += [w[e] for e in range(2 * n)]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        def poll(specs, scope="agent", batch=POLL_MAX, first=None):
             """Batched poll of mailbox pairs: `specs` = [(base_addr, pair index, npairs in {1, 2})].
 
             All pairs are loaded together with plain 8 / 16-byte coherent buffer loads
@@ -978,29 +1304,18 @@ def build_ml4_monokernel(
             the whole batch is re-loaded, so a batch costs one round trip after its
             last producer lands.  A side-effecting (compiler-opaque) asm statement in
             the retry loop keeps the loads from being hoisted.  Returns one list of
-            Int32 value bits per spec."""
+            Int32 value bits per spec. `first`: the ``poll_issue(specs)`` loads,
+            checked before any re-load."""
             if const_expr(len(specs) == 0):
                 return []
+            assert first is None or len(specs) <= batch
             if const_expr(len(specs) > batch):  # bound live registers
                 return poll(specs[:batch], scope, batch) + poll(
                     specs[batch:], scope, batch
                 )
-            cm = CM_DEV if const_expr(scope == "agent") else CM_SYS
 
             def load_all():
-                words = []
-                for b, i, n in specs:
-                    w = fx.Vector(
-                        bo.buffer_load(
-                            _rsrc(b),
-                            fx.Int32(i) * 2,
-                            vec_width=2 * n,
-                            dtype=T.i32,
-                            cache_modifier=cm,
-                        )
-                    )
-                    words += [w[e] for e in range(2 * n)]
-                return fx.Vector.from_elements(words, fx.Int32)
+                return poll_issue(specs, scope)
 
             nw = sum(2 * n for _, _, n in specs)
 
@@ -1010,7 +1325,7 @@ def build_ml4_monokernel(
                     bad = bad | (v[e] != tag)
                 return bad
 
-            v = load_all()
+            v = load_all() if const_expr(first is None) else first
             if const_expr(fault_offset is None):
                 while pending(v):
                     spin_pause()
@@ -1099,7 +1414,7 @@ def build_ml4_monokernel(
 
         def wave_max(v):
             for sh in range_constexpr(6):
-                v = _xred(v, 32 >> sh, fx.max)
+                v = _xred(v, 32 >> sh, fmax)
             return v
 
         def block_sums(vs):
@@ -1129,7 +1444,7 @@ def build_ml4_monokernel(
             for i in range_constexpr(len(vs)):
                 t = lds_ld(red, i * WAVES)
                 for w in range_constexpr(1, WAVES):
-                    t = fx.max(t, lds_ld(red, i * WAVES + w))
+                    t = fmax(t, lds_ld(red, i * WAVES + w))
                 tots.append(t)
             gpu.barrier()
             return tots
@@ -1410,10 +1725,8 @@ def build_ml4_monokernel(
                             b = fx.ptr_load(
                                 xs + (bw + sp * 16), result_type=v4f
                             ).bitcast(fx.BFloat16)
-                        c = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c])
-                        )
-                if const_expr(fmt == "f8f8"):  # one FP8 x FP8 MFMA (E8M0 scales = 1)
+                        c = _mfma_bf16(a, b, c)
+                if const_expr(fmt == "f8f8"):  # one 128-k FP8 x FP8 product, unscaled
                     a = fx.Vector.from_elements(
                         [wv[h][e] for h in range(2) for e in range(4)], fx.Int32
                     )
@@ -1426,12 +1739,7 @@ def build_ml4_monokernel(
                     b = fx.Vector.from_elements(
                         [bv[h][e] for h in range(2) for e in range(4)], fx.Int32
                     )
-                    one = fx.Int32(127)
-                    c = fx.Vector(
-                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                            T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one]
-                        )
-                    )
+                    c = mfma_f8f8_k128(a, b, c)
                 if const_expr(fmt == "native_mxfp4"):
                     raw, weight_scale, activation_scale_word = wv
                     activation_scale = lds_ld(misc, activation_scale_word).bitcast(
@@ -1493,11 +1801,11 @@ def build_ml4_monokernel(
                     b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(
                         fx.BFloat16
                     )
-                    c = fx.Vector(
-                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c])
-                    )
+                    c = _mfma_bf16(a, b, c)
                 if const_expr(coef is None):
                     acc = [acc[e] + c[e] for e in range(4)]
+                elif const_expr(_SCALAR_COEF):
+                    acc = [acc[e] + mul_unpacked(c[e], coef) for e in range(4)]
                 else:
                     acc = [acc[e] + c[e] * coef for e in range(4)]
             return acc
@@ -1545,11 +1853,42 @@ def build_ml4_monokernel(
                         )
                     emit(rl, n, tot)
 
-        def emit_out(stride):
+        def emit_out(stride, base=0):
             def f(rl, n, v):
-                lds_st(outs, n * stride + rl, v)
+                lds_st(outs, (base + n) * stride + rl, v)
 
             return f
+
+        def gemv_x_tiles(name, units, stride, mark=None):
+            """One row group of the q_b / index_q GEMV over the packed bf16 mailbox
+            `name` (S rows of HIDDEN), staged `X_TILE` samples at a time against
+            the same issued `units` (a callable: issued after the first staging).
+            Each output column is one sample, so the tiling is bit-identical.
+            (``_X_TILE_PRE``) a tile's first loads go out once the previous
+            tile's have landed, under its MFMA chain and reduction."""
+            nxt = None
+            for sb in range_constexpr(0, S, X_TILE):
+                cnt = min(X_TILE, S - sb)
+                stage_x_pairs(
+                    name, cnt * HIDDEN, lambda k, sb=sb: sb * HIDDEN + k, first=nxt
+                )
+                if const_expr(sb == 0 and mark is not None):
+                    stamp(mark[0], mark[1], 2)
+                gpu.barrier()
+                if const_expr(callable(units)):
+                    units = units()
+                # after the weights: loads retire in order
+                if const_expr(_X_TILE_PRE and sb + X_TILE < S):
+                    sb2 = sb + X_TILE
+                    nxt = poll_issue(
+                        stage_x_specs(
+                            name,
+                            min(X_TILE, S - sb2) * HIDDEN,
+                            lambda k, sb2=sb2: sb2 * HIDDEN + k,
+                        )
+                    )
+                acc = mma_units([fx.Float32(0.0) for _ in range(4)], units)
+                reduce_rows(1, acc, emit_out(stride, sb), cnt)
 
         def pick(values, index):
             value = values[0]
@@ -1618,7 +1957,7 @@ def build_ml4_monokernel(
                 amax = fx.Float32(0.0)
                 for i in range_constexpr(per):
                     for value in normed[s * per + i]:
-                        amax = fx.max(amax, fmath.absf(value))
+                        amax = fmax(amax, fmath.absf(value))
                 local_max.append(amax)
             maxima = block_maxs(local_max)
             scales = []
@@ -1720,7 +2059,7 @@ def build_ml4_monokernel(
                         row_values.append(values)
                         valids.append(valid)
                         for value in values:
-                            local_max = fx.max(
+                            local_max = fmax(
                                 local_max,
                                 valid.select(fmath.absf(value), fx.Float32(0.0)),
                             )
@@ -1815,18 +2154,21 @@ def build_ml4_monokernel(
                 gs.append([g[j] for j in range(4)])
             return gs, ld4s([(s, k) for s in range(count) for k in ks])
 
-        def stage_x_pairs(name, n_total, src_of):
+        def stage_x_specs(name, n_total, src_of):
+            """``stage_x_pairs``' poll specs past any remainder thread's."""
+            return [
+                (mb(name), src_of((tid + i * THREADS) * 4) // 2, 2)
+                for i in range(n_total // 4 // THREADS)
+            ]
+
+        def stage_x_pairs(name, n_total, src_of, first=None):
             """LDS bf16 X[k] = packed bf16 mailbox `name` element src_of(k) for k < n_total
             (src_of contiguous over aligned groups of 4): one 16-byte poll per 4 elements.
+            `first`: ``poll_issue`` of its ``stage_x_specs``.
             """
             nq = n_total // 4
             full = nq // THREADS
-            vals = poll(
-                [
-                    (mb(name), src_of((tid + i * THREADS) * 4) // 2, 2)
-                    for i in range(full)
-                ]
-            )
+            vals = poll(stage_x_specs(name, n_total, src_of), first=first)
             for i in range_constexpr(full):
                 for j in range_constexpr(2):
                     lds_st(
@@ -1841,14 +2183,37 @@ def build_ml4_monokernel(
 
         def quant_scaled(a0, a1):
             """Per-wave FP8 quant of a 128-block held as 2 f32 per lane -> (scaled q0, q1, scale)."""
-            amax = wave_max(fx.max(fmath.absf(a0), fmath.absf(a1)))
+            amax = fmax(fmath.absf(a0), fmath.absf(a1))
+            if const_expr(_QUANT_DPP):
+                return quant_from_max(a0, a1, abs_wave_max(amax))
+            for sh in range_constexpr(6):
+                amax = _xred(amax, 32 >> sh, fmax)
+            return quant_from_max(a0, a1, amax)
+
+        def abs_wave_max(m):
+            """Wave max of non-negative, non-NaN f32 lanes (wave-uniform)."""
+            return wave_umax_dpp(m.bitcast(fx.Int32)).bitcast(fx.Float32)
+
+        def quant_scaled_many(pairs):
+            """quant_scaled of several blocks with their max reductions interleaved:
+            each step's shuffles (LDS permutes for 32 / 16 on gfx942) overlap
+            instead of running one block's chain after another."""
+            amax = [fmax(fmath.absf(a0), fmath.absf(a1)) for a0, a1 in pairs]
+            if const_expr(_QUANT_DPP):
+                amax = [abs_wave_max(m) for m in amax]
+            else:
+                for sh in range_constexpr(6):
+                    amax = [_xred(m, 32 >> sh, fmax) for m in amax]
+            return [quant_from_max(a0, a1, m) for (a0, a1), m in zip(pairs, amax)]
+
+        def quant_from_max(a0, a1, amax):
             nz = amax > 0.0
             qs = nz.select(amax * (1.0 / FP8_MAX), fx.Float32(1.0))
             inv = nz.select(
                 _rcp(amax) * FP8_MAX, fx.Float32(1.0)
             )  # hardware rcp, no IEEE divide
-            q0 = fx.min(fx.max(a0 * inv, -FP8_MAX), FP8_MAX)
-            q1 = fx.min(fx.max(a1 * inv, -FP8_MAX), FP8_MAX)
+            q0 = fmin(fmax(a0 * inv, -FP8_MAX), FP8_MAX)
+            q1 = fmin(fmax(a1 * inv, -FP8_MAX), FP8_MAX)
             return q0, q1, qs
 
         def quant_mxfp8(a0, a1):
@@ -1894,7 +2259,7 @@ def build_ml4_monokernel(
                 for i in range_constexpr(nxw):
                     wd = (
                         tid + i * THREADS
-                        if const_expr(native_fp4_mfma)
+                        if const_expr(native_fp4_mfma or aiter_fp8_experts)
                         else f8_word((tid + i * THREADS) * 4)
                     )
                     lds_st(
@@ -1911,14 +2276,32 @@ def build_ml4_monokernel(
 
         def st_f8(k, q0, q1):
             """LDS FP8 activation bytes k, k + 1 (k even, held by this lane; lane ^ 1 holds
-            k ^ 2) in `f8_word` order.  Call from the whole wave."""
+            k ^ 2) in `f8_word` order (natural order for `aiter_fp8_experts`).  Call
+            from the whole wave."""
             w = (
                 fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
                 & 0xFFFF
             )
             nb = _xshfl(w, 1)
+            wd = k // 4 if const_expr(aiter_fp8_experts) else f8_word(k)
             if lane % 2 == 0:
-                lds_st(xs, f8_word(k), (w | (nb << 16)).bitcast(fx.Float32))
+                lds_st(xs, wd, (w | (nb << 16)).bitcast(fx.Float32))
+
+        def st_f8_many(items):
+            """st_f8 of several (k, q0, q1) under one lane-parity branch."""
+            ws = [
+                fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
+                & 0xFFFF
+                for _, q0, q1 in items
+            ]
+            nbs = [_xshfl(w, 1) for w in ws]
+            wds = [
+                k // 4 if const_expr(aiter_fp8_experts) else f8_word(k)
+                for k, _, _ in items
+            ]
+            if lane % 2 == 0:
+                for i in range_constexpr(len(items)):
+                    lds_st(xs, wds[i], (ws[i] | (nbs[i] << 16)).bitcast(fx.Float32))
 
         def st_mxfp8(k, q0, q1):
             """Store one row-major MXFP8 pair for the scaled MFMA."""
@@ -2002,7 +2385,7 @@ def build_ml4_monokernel(
             lg = valid.select(raw.bitcast(fx.Float32), fx.Float32(-1.0e30))
             mx = lg
             for off in (1, 2, 4):
-                mx = _xred(mx, off, lambda a, b: fx.max(a, b))
+                mx = _xred(mx, off, fmax)
             ex = valid.select(_exp(lg - mx), fx.Float32(0.0))
             tot = ex
             for off in (1, 2, 4):
@@ -2136,24 +2519,71 @@ def build_ml4_monokernel(
         def start(name):
             return (bid + (G - base[name])) & (G - 1)
 
+        # Read once: a param-table load inside a stage would retire every load
+        # its wave has in flight (`vmcnt` is in order) and skew what it measures.
+        tl_base = timeline_buf
+        if const_expr(timeline and (with_indexer or separate_shared)):
+            tl_base = index_arg(7)
+
         def stamp(name, t, which, lead=0):
-            if const_expr(timeline):
-                if tid == lead:
-                    now = mem_realtime()
-                    tl_addr = index_arg(7) if const_expr(with_indexer) else timeline_buf
-                    fx.generic_store(
-                        fx.inttoptr(
-                            fx.PointerType.get(
-                                fx.Int64.ir_type, fx.AddressSpace.Global, 8
-                            ),
-                            tl_addr + fx.Int64((first[name] + t) * TL_COLS + which) * 8,
+            if const_expr(
+                timeline
+                and (not _TL_ONLY or name in _TL_ONLY)
+                and (not _TL_COLS or which in _TL_COLS)
+            ):
+                # The lead's whole wave stores the same word under a uniform
+                # branch, the address in SGPRs. Stamps still cost registers:
+                # the full rope timeline build runs at 256 VGPRs with 80
+                # spills (none without stamps), so `MONO_TL_ONLY` /
+                # `MONO_TL_COLS` keep a measurement to the stages it is about.
+                if _uniform(wave) == lead // 64:
+                    bo.buffer_store(
+                        mem_realtime(),
+                        _rsrc(tl_base),
+                        fx.Int32(0),
+                        soffset_bytes=_uniform(
+                            ((first[name] + t) * TL_COLS + which) * 8
                         ),
-                        now,
                     )
 
         def n_sel(count=S):
             """This lane's local MFMA B column; inactive columns duplicate the last one."""
             return fx.min(lane % 16, count - 1)
+
+        # (``_SPLIT_PRE``) one load, one word per lane (``ld_row``): the rows'
+        # positions, slots and index bounds, and per split round r of this
+        # CTA its task's page (lane 48 + 2 r) and its row's page 0 (49 + 2 r).
+        # Lanes past a table's end repeat its last entry.
+        row_pre = None
+        if const_expr(_SPLIT_PRE):
+            pre_j, pre_k = lane // 16, lane % 16
+            pre_row = fx.min(pre_k, fx.Int32(S - 1))
+            pre_r = fx.min(pre_k // 2, fx.Int32((N_SPLIT_TASKS + G - 1) // G - 1))
+            pre_s, pre_hg, pre_t = split_coords(start("split") + pre_r * G)
+            pre_s = fx.min(pre_s, fx.Int32(S - 1))  # past the last task: unused
+            pre_page = (pre_k % 2 == 0).select(
+                fx.min(
+                    pre_t * SPLIT_KEYS // index_page_size,
+                    fx.Int32(index_block_table_stride - 1),
+                ),
+                fx.Int32(0),
+            )
+            pre_bt = (pre_s // index_request_width) * index_block_table_stride
+            pre_ptr = (
+                positions + pre_row * 8
+                if const_expr(own_key_counts)
+                else sparse_kv_indptr + fx.min(pre_k, fx.Int32(S)) * 4
+            )
+            pre_addr = (pre_j == 3).select(
+                cur_pos + (pre_bt + pre_page) * 4,
+                (pre_j == 2).select(
+                    pre_ptr,
+                    (pre_j == 1).select(
+                        slot_mapping + pre_row * 8, positions + pre_row * 8
+                    ),
+                ),
+            )
+            row_pre = fx.Int32(global_load(pre_addr))
 
         # ================================================= 1. q_a / kv_a GEMV
         # 1 row group x 96 chunks: 8 waves split K, 12 chunks each (all prefetched)
@@ -2163,10 +2593,17 @@ def build_ml4_monokernel(
         if const_expr(with_indexer):
             r_wik, r_sik = _rsrc(index_arg(0)), _rsrc(index_arg(1))
             r_wiw = _rsrc(index_arg(2))
-        for t in range(start("qkv_a"), N_QKV_A, G):
-            t = fx.Int32(t)
-            stamp("qkv_a", t, 0)
-            for sample_base in range_constexpr(0, S, SAMPLE_TILE):
+        IW_CPW = QA_NKC // WAVES
+        N_QKV_T = N_QKV_A + N_QKV_IDX
+        assert QKV_TILES in (1, (S + SAMPLE_TILE - 1) // SAMPLE_TILE)
+        for tt in range(start("qkv_a"), N_QKV_T * QKV_TILES, G):
+            tt = fx.Int32(tt)
+            t = tt
+            if const_expr(QKV_TILES > 1):
+                t = tt % N_QKV_T
+            stamp("qkv_a", tt, 0)
+
+            def qkv_tile(sample_base):
                 group_count = min(SAMPLE_TILE, S - sample_base)
 
                 def u_qa(c):
@@ -2197,99 +2634,135 @@ def build_ml4_monokernel(
                         res.append([v[j] for j in range(4)])
                     return res
 
-                if const_expr(S <= SAMPLE_TILE):
-                    h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in, group_count)
-                    pre = [u_qa(c) for c in range(QA_UNITS)]
-                    if const_expr(attention_ptpc):
-                        qa_scales = stage_x_rmsnorm_ptpc(
-                            ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
-                        )
+                def stage_h(issue):
+                    """Stage this tile's RMSNorm(h) and issue() its weight units,
+                    ahead of the staging when the h loads fit beside them."""
+                    scales = None
+                    if const_expr(S <= SAMPLE_TILE):
+                        h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in, group_count)
+                        units = issue()
+                        if const_expr(attention_ptpc):
+                            scales = stage_x_rmsnorm_ptpc(
+                                ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
+                            )
+                        else:
+                            stage_x_rmsnorm(
+                                ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
+                            )
                     else:
-                        stage_x_rmsnorm(
-                            ld_h, HIDDEN, g_in, loaded=h_ld, count=group_count
-                        )
-                else:
-                    if const_expr(attention_ptpc):
-                        qa_scales = stage_x_rmsnorm_ptpc(
-                            ld_h, HIDDEN, g_in, count=group_count
-                        )
-                    else:
-                        stage_x_rmsnorm(ld_h, HIDDEN, g_in, count=group_count)
-                    pre = [u_qa(c) for c in range(QA_UNITS)]
-                gpu.barrier()
-                stamp("qkv_a", t, 2)
-                acc = run_units(u_qa, QA_UNITS, QA_UNITS, pre)
-                if const_expr(attention_ptpc):
-                    reduce_rows(
-                        1,
-                        acc,
-                        emit_ptpc(QKV_A_TILE, t * QKV_A_TILE, r_sqa, qa_scales),
-                        group_count,
-                    )
-                else:
-                    reduce_rows(1, acc, emit_out(QKV_A_TILE), group_count)
-                stamp("qkv_a", t, 3)
-                gpu.barrier()
-                if tid < group_count * QKV_A_TILE:
-                    s = sample_base + tid // QKV_A_TILE
-                    row = t * QKV_A_TILE + tid % QKV_A_TILE
-                    v = lds_ld(outs, tid)
-                    if row < Q_LORA:
-                        put(mb("q_a"), s * Q_LORA + row, v)
-                    else:
-                        put(mb("kv_a"), s * (KV_LORA + PE_DIM) + row - Q_LORA, v)
+                        if const_expr(attention_ptpc):
+                            scales = stage_x_rmsnorm_ptpc(
+                                ld_h, HIDDEN, g_in, count=group_count
+                            )
+                        else:
+                            stage_x_rmsnorm(ld_h, HIDDEN, g_in, count=group_count)
+                        units = issue()
+                    gpu.barrier()
+                    stamp("qkv_a", tt, 2)
+                    return units, scales
 
-                if const_expr(with_indexer):
-                    IW_CPW = QA_NKC // WAVES
+                def kv_a_tile():
+                    pre, qa_scales = stage_h(lambda: [u_qa(c) for c in range(QA_UNITS)])
+                    acc = run_units(u_qa, QA_UNITS, QA_UNITS, pre)
+                    if const_expr(attention_ptpc):
+                        reduce_rows(
+                            1,
+                            acc,
+                            emit_ptpc(QKV_A_TILE, t * QKV_A_TILE, r_sqa, qa_scales),
+                            group_count,
+                        )
+                    else:
+                        reduce_rows(1, acc, emit_out(QKV_A_TILE), group_count)
+                    stamp("qkv_a", tt, 3)
+                    gpu.barrier()
+                    if tid < group_count * QKV_A_TILE:
+                        s = sample_base + tid // QKV_A_TILE
+                        row = t * QKV_A_TILE + tid % QKV_A_TILE
+                        v = lds_ld(outs, tid)
+                        if row < Q_LORA:
+                            put(mb("q_a"), s * Q_LORA + row, v)
+                        else:
+                            put(mb("kv_a"), s * (KV_LORA + PE_DIM) + row - Q_LORA, v)
 
-                    def u_index_w(c):
+                def u_index_w(rg):
+                    def make(c):
                         kc = wave * IW_CPW + c
                         return unit_bf16(
                             r_wiw,
-                            t,
+                            rg,
                             kc,
                             QA_NKC,
                             (INDEX_BF16_OFF if const_expr(attention_ptpc) else 0)
                             + (n_sel(group_count) * HIDDEN + kc * 64) // 2,
                         )
 
-                    if t < INDEX_DIM // QKV_A_TILE:
+                    return make
 
-                        def u_index_k(c):
-                            kc = (wave * QA_UNITS + c) * 2
-                            return unit_fp8x2(
-                                r_wik,
-                                r_sik,
-                                t,
-                                kc,
-                                QA_NKC,
-                                HIDDEN,
-                                (INDEX_BF16_OFF if const_expr(attention_ptpc) else 0)
-                                + (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                def u_index_k(rg):
+                    def make(c):
+                        kc = (wave * QA_UNITS + c) * 2
+                        return unit_fp8x2(
+                            r_wik,
+                            r_sik,
+                            rg,
+                            kc,
+                            QA_NKC,
+                            HIDDEN,
+                            (INDEX_BF16_OFF if const_expr(attention_ptpc) else 0)
+                            + (n_sel(group_count) * HIDDEN + kc * 64) // 2,
+                        )
+
+                    return make
+
+                def put_index(acc, name, width, rg):
+                    reduce_rows(1, acc, emit_out(INDEX_TILE), group_count)
+                    gpu.barrier()
+                    if tid < group_count * INDEX_TILE:
+                        s = sample_base + tid // INDEX_TILE
+                        row = rg * INDEX_TILE + tid % INDEX_TILE
+                        put(mb(name), s * width + row, lds_ld(outs, tid))
+
+                def index_tile(rg, units, cpw, name, width):
+                    """One index key / head-weight tile as a task of its own."""
+                    make = units(rg)
+                    pre, _ = stage_h(lambda: [make(c) for c in range(cpw)])
+                    put_index(run_units(make, cpw, cpw, pre), name, width, rg)
+
+                if const_expr(N_QKV_IDX == 0):
+                    kv_a_tile()
+                    if const_expr(with_indexer):
+                        if t < INDEX_DIM // QKV_A_TILE:
+                            ik_acc = run_units(u_index_k(t), QA_UNITS, QA_UNITS)
+                            iw_acc = [fx.Float32(0.0) for _ in range(4)]
+                            if t < INDEX_HEADS // QKV_A_TILE:
+                                iw_acc = run_units(u_index_w(t), IW_CPW, IW_CPW)
+                            put_index(ik_acc, "index_k", INDEX_DIM, t)
+                            if t < INDEX_HEADS // QKV_A_TILE:
+                                put_index(iw_acc, "index_w", INDEX_HEADS, t)
+                else:
+                    if t < N_QKV_A:
+                        kv_a_tile()
+                    else:
+                        if t < N_QKV_A + INDEX_DIM // QKV_A_TILE:
+                            index_tile(
+                                t - N_QKV_A, u_index_k, QA_UNITS, "index_k", INDEX_DIM
+                            )
+                        else:
+                            index_tile(
+                                t - (N_QKV_A + INDEX_DIM // QKV_A_TILE),
+                                u_index_w,
+                                IW_CPW,
+                                "index_w",
+                                INDEX_HEADS,
                             )
 
-                        ik_acc = run_units(u_index_k, QA_UNITS, QA_UNITS)
-                        iw_acc = [fx.Float32(0.0) for _ in range(4)]
-                        if t < INDEX_HEADS // QKV_A_TILE:
-                            iw_acc = run_units(u_index_w, IW_CPW, IW_CPW)
-                        reduce_rows(1, ik_acc, emit_out(INDEX_TILE), group_count)
-                        gpu.barrier()
-                        if tid < group_count * INDEX_TILE:
-                            s = sample_base + tid // INDEX_TILE
-                            row = t * INDEX_TILE + tid % INDEX_TILE
-                            put(mb("index_k"), s * INDEX_DIM + row, lds_ld(outs, tid))
-                        if t < INDEX_HEADS // QKV_A_TILE:
-                            reduce_rows(1, iw_acc, emit_out(INDEX_TILE), group_count)
-                            gpu.barrier()
-                            if tid < group_count * INDEX_TILE:
-                                s = sample_base + tid // INDEX_TILE
-                                row = t * INDEX_TILE + tid % INDEX_TILE
-                                put(
-                                    mb("index_w"),
-                                    s * INDEX_HEADS + row,
-                                    lds_ld(outs, tid),
-                                )
-            stamp("qkv_a", t, 4)
+            for sample_base in range_constexpr(0, S, SAMPLE_TILE):
+                if const_expr(QKV_TILES > 1):
+                    if tt // N_QKV_T == sample_base // SAMPLE_TILE:
+                        qkv_tile(sample_base)
+                else:
+                    qkv_tile(sample_base)
+            stamp("qkv_a", tt, 4)
 
         def ld_qa(sks):
             v = get2_many(
@@ -2353,52 +2826,82 @@ def build_ml4_monokernel(
             stamp("q_norm", s_norm, 4)
 
         # ================ 3. KV RMSNorm + k_pe RoPE -> cache (+ this launch's rows)
-        for t in range(start("cache"), 1, G):
+        for t in range(start("cache"), CACHE_TASKS, G):
             stamp("cache", t, 0)
+            # the task's rows: all of them, or row t alone (`cache_per_row`)
+            rows = [fx.Int32(t)] if const_expr(CACHE_TASKS > 1) else list(range(S))
+            n_rows = len(rows)
             r_kv = _rsrc(kv_cache)
             r_pe = _rsrc(pe_cache)
-            # gamma and the RoPE factors are issued ahead of the wait
+            # gamma and the RoPE factors are issued ahead of the wait; on gfx942
+            # each row's position, slot and index cell too: loaded per row after
+            # the stores below, every row would pay its own round trips
             g = ld_bf16(_rsrc(g_kv), tid)
             t_pe = tid % (PE_DIM // 2)
+            if const_expr(GFX942):
+                row_pos = [row_position(s) for s in rows]
+                slots = [row_slot(s) for s in rows]
+
+            def pos_of(i):
+                return row_pos[i] if const_expr(GFX942) else row_position(rows[i])
+
+            def slot_of(i):
+                return slots[i] if const_expr(GFX942) else row_slot(rows[i])
+
+            def writes_of(i):
+                if const_expr(GFX942):
+                    return slots[i] >= 0
+                return row_writes_cache(rows[i])
+
             cs = [
-                ld_rope(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + t_pe)
-                for s in range(S)
+                ld_rope(_rsrc(rope_cos), pos_of(i) * (PE_DIM // 2) + t_pe)
+                for i in range(n_rows)
             ]
             sns = [
-                ld_rope(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + t_pe)
-                for s in range(S)
+                ld_rope(_rsrc(rope_sin), pos_of(i) * (PE_DIM // 2) + t_pe)
+                for i in range(n_rows)
             ]
+            if const_expr(with_indexer and GFX942):
+                # the index key's LayerNorm gamma / beta pair and each row's cell
+                i_gb = fx.min(tid, INDEX_DIM // 2 - 1) * 2
+                ik_gb = [
+                    ld_f32(_rsrc(index_arg(a)), i_gb + j)
+                    for a in (5, 6)
+                    for j in (0, 1)
+                ]
+                if const_expr(index_fp8):
+                    ik_cells = [index_page_cell(s, p) for s, p in zip(rows, row_pos)]
+                else:
+                    ik_cells = [index_page_slot(s, p) for s, p in zip(rows, row_pos)]
             hint_wait(
                 (KV_LORA + PE_DIM) // QKV_A_TILE,
                 lambda k: (
                     mb("kv_a"),
-                    (S - 1) * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1,
+                    rows[-1] * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1,
                 ),
                 mark=("cache", t),
             )
             # every sample's kv latent and k_pe pair in one poll, one block reduction
-            vs = getf_many(
-                [(mb("kv_a"), s * (KV_LORA + PE_DIM) + tid) for s in range(S)]
-            )
+            vs = getf_many([(mb("kv_a"), s * (KV_LORA + PE_DIM) + tid) for s in rows])
             pes = get2_many(
                 [
                     (
                         mb("kv_a"),
                         s * (KV_LORA + PE_DIM) + KV_LORA + (tid % (PE_DIM // 2)) * 2,
                     )
-                    for s in range(S)
+                    for s in rows
                 ]
             )
             stamp("cache", t, 2)
             if const_expr(KV_SHARE):
                 # ML4 KV-sharing layer: no latent of its own. Attend to the source layer's cache, whose rows for this
                 # step were written earlier in the same step; never store into it.
-                for s in range_constexpr(S):
-                    pos = row_position(s)
+                for i in range_constexpr(n_rows):
+                    s, pos = rows[i], pos_of(i)
                     # A padded row (slot -1) has no source row: read slot 0 instead of
                     # wrapping the 32-bit buffer offset ~4 GiB past the cache (memory
                     # fault). Its kvnew is never read: patch_new_kv matches active rows only.
-                    slot = row_writes_cache(s).select(row_slot(s), fx.Int32(0))
+                    slot = writes_of(i).select(slot_of(i), fx.Int32(0))
                     if const_expr(cache_fp8):
                         # fp8 implies the ATOM layout (asserted above): one byte per value
                         kvn = ld_fp8(r_kv, slot * QK_DIM + tid)
@@ -2421,11 +2924,9 @@ def build_ml4_monokernel(
                         put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
             else:
                 ssq = block_sums([v * v for v in vs])
-                for s in range_constexpr(S):
-                    pos = row_position(s)
-                    slot = row_slot(s)
-                    active = row_writes_cache(s)
-                    value = vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g
+                for i in range_constexpr(n_rows):
+                    s, pos, slot, active = rows[i], pos_of(i), slot_of(i), writes_of(i)
+                    value = vs[i] * _rsq(ssq[i] * (1.0 / KV_LORA) + EPS) * g
                     if const_expr(cache_fp8):
                         # saturate like vLLM's fp8 cache writer (and torch): the
                         # conversion turns |x| > FP8_MAX into NaN
@@ -2458,8 +2959,8 @@ def build_ml4_monokernel(
                         bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
                     put(mb("kvnew"), s * KV_LORA + tid, kvn)
                     if tid < PE_DIM // 2:
-                        x0, x1 = pes[s]
-                        c, sn = cs[s], sns[s]
+                        x0, x1 = pes[i]
+                        c, sn = cs[i], sns[i]
                         p0, p1 = x0 * c - x1 * sn, x0 * sn + x1 * c
                         if const_expr(cache_fp8):
                             p0 = _fp8_sat(bf16_round(p0))
@@ -2503,16 +3004,33 @@ def build_ml4_monokernel(
                 # the first 64 dimensions, and the build's index cache format.
                 # Hadamard is omitted because applying the same orthogonal
                 # transform to Q and K leaves their dot products unchanged.
-                r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
+                if const_expr(not GFX942):
+                    r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
                 r_index_cache = _rsrc(indices)
-                for s in range_constexpr(S):
+
+                def ik_gamma(i0, j):
+                    return ik_gb[j] if const_expr(GFX942) else ld_f32(r_gik, i0 + j)
+
+                def ik_beta(i0, j):
+                    return ik_gb[2 + j] if const_expr(GFX942) else ld_f32(r_bik, i0 + j)
+
+                def ik_cell(i):
+                    if const_expr(GFX942):
+                        return ik_cells[i]
+                    s = rows[i]
+                    if const_expr(index_fp8):
+                        return index_page_cell(s, row_position(s))
+                    return index_page_slot(s, row_position(s))
+
+                for i in range_constexpr(n_rows):
+                    s = rows[i]
                     # Same gate the MLA kv/pe writes above use: a pad row has
                     # slot_mapping -1 and row_position 0, so an ungated store
                     # would land on row 0 of whatever page this request's block
                     # table happens to point at and clobber a live request's
                     # position-0 index key. The mailbox publishes below stay
                     # ungated -- index_score polls every row.
-                    active = row_writes_cache(s)
+                    active = writes_of(i)
                     ik = getf(mb("index_k"), s * INDEX_DIM + fx.min(tid, INDEX_DIM - 1))
                     live = tid < INDEX_DIM
                     iv = live.select(ik, fx.Float32(0.0))
@@ -2524,13 +3042,11 @@ def build_ml4_monokernel(
                     if tid < INDEX_DIM // 2:
                         i0 = tid * 2
                         k0, k1 = get2(mb("index_k"), s * INDEX_DIM + i0)
-                        v0 = (k0 - mean) * rstd * ld_f32(r_gik, i0) + ld_f32(r_bik, i0)
-                        v1 = (k1 - mean) * rstd * ld_f32(r_gik, i0 + 1) + ld_f32(
-                            r_bik, i0 + 1
-                        )
+                        v0 = (k0 - mean) * rstd * ik_gamma(i0, 0) + ik_beta(i0, 0)
+                        v1 = (k1 - mean) * rstd * ik_gamma(i0, 1) + ik_beta(i0, 1)
                         if const_expr(INDEX_ROPE):
                             if tid < PE_DIM // 2:
-                                c, sn = cs[s], sns[s]
+                                c, sn = cs[i], sns[i]
                                 v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
                         if const_expr(index_fp8):
                             # ATOM's plane: the production writer rounds the
@@ -2539,17 +3055,18 @@ def build_ml4_monokernel(
                             # bytes preshuffled into MFMA 16x16 tiles with the
                             # fp32 scales in a separate per-page segment.
                             v0, v1 = bf16_round(v0), bf16_round(v1)
-                            amax = fx.max(
-                                wave_max(fx.max(fmath.absf(v0), fmath.absf(v1))),
+                            amax = fmax(
+                                wave_max(fmax(fmath.absf(v0), fmath.absf(v1))),
                                 fx.Float32(1.0e-4),
                             )
-                            # exp2(ceil(log2(amax / 448))) as an exact statement
-                            # about the exponent field: amax = m * 2**a with
-                            # m <= 1.75 gives 2**(a - 8), m > 1.75 gives
-                            # 2**(a - 7).  No divide, no log2, so no 1-ulp slip
-                            # across a power of two -- which would halve a row.
+                            # exp2(ceil(log2(amax / INDEX_FP8_MAX))) as an exact
+                            # statement about the exponent field: INDEX_FP8_MAX
+                            # = 1.75 * 2**d, so amax = m * 2**a with m <= 1.75
+                            # gives 2**(a - d), m > 1.75 gives 2**(a - d + 1).
+                            # No divide, no log2, so no 1-ulp slip across a
+                            # power of two -- which would halve a row.
                             bits = amax.bitcast(fx.Int32)
-                            exponent = ((bits >> 23) & fx.Int32(0xFF)) - 8
+                            exponent = ((bits >> 23) & fx.Int32(0xFF)) - INDEX_FP8_EXP
                             exponent = exponent + (
                                 (bits & fx.Int32(0x7FFFFF)) > fx.Int32(0x600000)
                             ).select(fx.Int32(1), fx.Int32(0))
@@ -2558,9 +3075,9 @@ def build_ml4_monokernel(
                             )
                             qs = (exponent << 23).bitcast(fx.Float32)
                             inv = ((fx.Int32(254) - exponent) << 23).bitcast(fx.Float32)
-                            q0 = fx.min(fx.max(v0 * inv, -FP8_MAX), FP8_MAX)
-                            q1 = fx.min(fx.max(v1 * inv, -FP8_MAX), FP8_MAX)
-                            page, row = index_page_cell(s, row_position(s))
+                            q0 = fmin(fmax(v0 * inv, -INDEX_FP8_MAX), INDEX_FP8_MAX)
+                            q1 = fmin(fmax(v1 * inv, -INDEX_FP8_MAX), INDEX_FP8_MAX)
+                            page, row = ik_cell(i)
                             pair = fx.Int32(
                                 rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
                             ) & fx.Int32(0xFFFF)
@@ -2610,8 +3127,7 @@ def build_ml4_monokernel(
                                         fx.BFloat16
                                     ),
                                     r_index_cache,
-                                    index_page_slot(s, row_position(s)) * INDEX_DIM
-                                    + i0,
+                                    ik_cell(i) * INDEX_DIM + i0,
                                 )
                             put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
                     gpu.barrier()
@@ -2640,7 +3156,7 @@ def build_ml4_monokernel(
                     QB_NKC,
                     HIDDEN,
                     128,
-                    attention_b_word(n_sel() * HIDDEN + kc * 64),
+                    attention_b_word(n_sel(X_TILE) * HIDDEN + kc * 64),
                 )
 
             pre = [u_qb(c) for c in range(QB_UNITS)]
@@ -2653,15 +3169,12 @@ def build_ml4_monokernel(
                 qb_scales = stage_x_pairs_ptpc(
                     "q_an", S, Q_LORA, lambda k: k, retain_bf16=with_indexer
                 )
-            else:
-                stage_x_pairs("q_an", S * HIDDEN, lambda k: k)
-            stamp("q_b", t, 2)
-            gpu.barrier()
-            acc = run_units(u_qb, QB_UNITS, QB_UNITS, pre)
-            if const_expr(attention_ptpc):
+                stamp("q_b", t, 2)
+                gpu.barrier()
+                acc = run_units(u_qb, QB_UNITS, QB_UNITS, pre)
                 reduce_rows(1, acc, emit_ptpc(Q_B_TILE, t * Q_B_TILE, r_sqb, qb_scales))
             else:
-                reduce_rows(1, acc, emit_out(Q_B_TILE))
+                gemv_x_tiles("q_an", pre, Q_B_TILE, mark=("q_b", t))
             stamp("q_b", t, 3)
             gpu.barrier()
             head = t // QB_PER_HEAD
@@ -2713,40 +3226,49 @@ def build_ml4_monokernel(
             stamp("q_b", t, 4)
 
             if const_expr(with_indexer and not SHARD_INDEX_Q):
-                # Reuse this CTA's normalized q_lora tile for one index-query
-                # row tile.  Complementary CTAs compute the remaining half below.
-                gpu.barrier()
-                iq_t = t
-                stamp("index_q", iq_t, 0)
-                # ML4: the indexer query reads LayerNorm(normed x), not this CTA's staged q_b input -- re-stage it.
-                stage_x_pairs("iq_an", S * HIDDEN, lambda k: k)
-                gpu.barrier()
 
-                def u_index_q(c):
-                    kc = (wave * QB_UNITS + c) * 2
-                    return unit_fp8x2(
-                        r_wiq,
-                        r_siq,
-                        iq_t,
-                        kc,
-                        QB_NKC,
-                        HIDDEN,
-                        (n_sel() * HIDDEN + kc * 64) // 2,
-                    )
+                def qb_index_q():
+                    # Reuse this CTA's normalized q_lora tile for one index-query
+                    # row tile.  Complementary CTAs compute the remaining half below.
+                    gpu.barrier()
+                    iq_t = t
+                    stamp("index_q", iq_t, 0)
 
-                iq_acc = run_units(u_index_q, QB_UNITS, QB_UNITS)
-                reduce_rows(1, iq_acc, emit_out(INDEX_TILE))
-                stamp("index_q", iq_t, 3)
-                gpu.barrier()
-                if tid < S * INDEX_TILE // 4:
-                    s = tid // (INDEX_TILE // 4)
-                    r = (tid % (INDEX_TILE // 4)) * 4
-                    put_bf(
-                        mb("index_q"),
-                        s * INDEX_Q_ROWS + iq_t * INDEX_TILE + r,
-                        [lds_ld(outs, s * INDEX_TILE + r + j) for j in range(4)],
+                    # ML4: the indexer query reads LayerNorm(normed x), not this CTA's staged q_b input -- re-stage it.
+                    def u_index_q(c):
+                        kc = (wave * QB_UNITS + c) * 2
+                        return unit_fp8x2(
+                            r_wiq,
+                            r_siq,
+                            iq_t,
+                            kc,
+                            QB_NKC,
+                            HIDDEN,
+                            (n_sel(X_TILE) * HIDDEN + kc * 64) // 2,
+                        )
+
+                    gemv_x_tiles(
+                        "iq_an",
+                        lambda: [u_index_q(c) for c in range(QB_UNITS)],
+                        INDEX_TILE,
                     )
-                stamp("index_q", iq_t, 4)
+                    stamp("index_q", iq_t, 3)
+                    gpu.barrier()
+                    if tid < S * INDEX_TILE // 4:
+                        s = tid // (INDEX_TILE // 4)
+                        r = (tid % (INDEX_TILE // 4)) * 4
+                        put_bf(
+                            mb("index_q"),
+                            s * INDEX_Q_ROWS + iq_t * INDEX_TILE + r,
+                            [lds_ld(outs, s * INDEX_TILE + r + j) for j in range(4)],
+                        )
+                    stamp("index_q", iq_t, 4)
+
+                if const_expr(_DENSE_SHORT):
+                    if any_long_row():
+                        qb_index_q()
+                else:
+                    qb_index_q()
 
         if const_expr(with_indexer):
             # The 128 CTAs without q_b work produce the other 128 index-query
@@ -2757,7 +3279,12 @@ def build_ml4_monokernel(
                 if SHARD_INDEX_Q
                 else INDEX_Q_ROWS // INDEX_TILE - N_QB
             )
-            for tt in range(start("index_q"), N_INDEX_Q_EXTRA, G):
+            n_index_q_extra = (
+                any_long_row().select(fx.Int32(N_INDEX_Q_EXTRA), fx.Int32(0))
+                if const_expr(_DENSE_SHORT)
+                else N_INDEX_Q_EXTRA
+            )
+            for tt in range(start("index_q"), n_index_q_extra, G):
                 tt = fx.Int32(tt)
                 iq_t = (
                     cp_local_rank() * N_INDEX_Q_EXTRA + tt
@@ -2776,7 +3303,7 @@ def build_ml4_monokernel(
                         kc,
                         QB_NKC,
                         HIDDEN,
-                        (n_sel() * HIDDEN + kc * 64) // 2,
+                        (n_sel(X_TILE) * HIDDEN + kc * 64) // 2,
                     )
 
                 pre = [u_index_q_extra(c) for c in range(QB_UNITS)]
@@ -2785,11 +3312,7 @@ def build_ml4_monokernel(
                     lambda s: (mb("iq_an"), (s * HIDDEN + HIDDEN - 2) // 2),
                     mark=("index_q", iq_task),
                 )
-                stage_x_pairs("iq_an", S * HIDDEN, lambda k: k)
-                stamp("index_q", iq_task, 2)
-                gpu.barrier()
-                iq_acc = run_units(u_index_q_extra, QB_UNITS, QB_UNITS, pre)
-                reduce_rows(1, iq_acc, emit_out(INDEX_TILE))
+                gemv_x_tiles("iq_an", pre, INDEX_TILE, mark=("index_q", iq_task))
                 stamp("index_q", iq_task, 3)
                 gpu.barrier()
                 if const_expr(SHARD_INDEX_Q):
@@ -2950,7 +3473,7 @@ def build_ml4_monokernel(
                 request_start = index_request_start(s)
                 first_position = row_position(request_start)
                 shard_begin, shard_size = index_shard(s)
-                if tile * INDEX_KEYS_PER_TASK < shard_size:
+                if (tile * INDEX_KEYS_PER_TASK < shard_size) & long_row(s):
                     get(mb("index_ready"), s)
                     if tid < INDEX_HEADS:
                         lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
@@ -3058,17 +3581,13 @@ def build_ml4_monokernel(
                             kv = fx.Vector.from_elements(kv_values, fx.Float32).to(
                                 fx.BFloat16
                             )
-                        score_frag = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(
-                                T.vec(4, T.f32), [qv, kv, score_frag]
-                            )
-                        )
+                        score_frag = _mfma_bf16(qv, kv, score_frag)
                     partial = fx.Float32(0.0)
                     for e in range_constexpr(4):
                         index_head = head_group * 16 + (lane // 16) * 4 + e
                         weight = lds_ld(keys, index_head).bitcast(fx.Float32)
                         partial = (
-                            partial + fx.max(score_frag[e], fx.Float32(0.0)) * weight
+                            partial + fmax(score_frag[e], fx.Float32(0.0)) * weight
                         )
                     if const_expr(index_fp8):
                         # Rows this launch wrote came from the mailbox already
@@ -3494,7 +4013,7 @@ def build_ml4_monokernel(
                             # level's answer is the token's: both traced on
                             # ``bound``, so a context below the build's maximum ends
                             # the tree early without a second compiled path.
-                            if j < tree_count(bound, level, SEG, FAN):
+                            if (j < tree_count(bound, level, SEG, FAN)) & long_row(s):
                                 stamp(SEL_STAGE, tt, 0)
                                 n_in = tree_inputs(bound, level, j, SEG, FAN, topk)
                                 at_final = (
@@ -3818,19 +4337,36 @@ def build_ml4_monokernel(
         r_idx = _rsrc(indices)
         KPW = SPLIT_KEYS // WAVES
 
-        def split_keys(t, s):
-            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
-            if const_expr(use_atom_kv_cache):
-                index_base, index_end = row_index_bounds(s)
-                nkeys = index_end - index_base
-                sparse = index_end > index_base
-            else:
-                index_base = s * topk
-                kv_len = pos0 + s + 1
-                sparse = kv_len > topk
-                nkeys = sparse.select(fx.Int32(topk), kv_len)
+        def page_key_slot(k_pos, nkeys, pages):
+            """``index_page_slot`` of a dense row's key k_pos -- key 0's past
+            nkeys -- from its split's (page, page 0) ``split_pre_pick``."""
+            page_t, page_0 = pages
+            return (k_pos < nkeys).select(
+                page_t * index_page_size + k_pos % index_page_size,
+                page_0 * index_page_size,
+            )
+
+        def selected_key(s, k):
+            """Key position k of row s's indexer top-k."""
+            return fx.Int32(
+                bo.buffer_load(
+                    _rsrc(mb("indices")),
+                    s * topk + k,
+                    vec_width=1,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+
+        def split_keys(t, s, rows=None, pages=None):
+            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS.
+            ``rows``: ``split_rows(s)`` if already loaded; ``pages``: its
+            ``split_pre_pick`` pages (``_SPLIT_PRE``)."""
+            nkeys, sparse, use_indices, index_base = (
+                split_rows(s) if const_expr(rows is None) else rows
+            )
             if const_expr(with_indexer):
-                if sparse:
+                if use_indices:
                     if wave == 0:
                         if lane == 0:
                             get(mb("indices_ready"), s)
@@ -3843,23 +4379,22 @@ def build_ml4_monokernel(
                 if lane < SPLIT_KEYS:
                     k_pos = t * SPLIT_KEYS + lane
                     k_cl = (k_pos < nkeys).select(k_pos, 0)
-                    if const_expr(with_indexer):
+                    if const_expr(with_indexer and pages is not None):
+                        k_slot = page_key_slot(k_pos, nkeys, pages)
+                        if use_indices:
+                            k_slot = index_page_slot(s, selected_key(s, k_cl))
+                        lds_st(attn_keys, lane, k_slot)
+                    elif const_expr(with_indexer):
                         idx = k_cl
-                        if sparse:
-                            idx = fx.Int32(
-                                bo.buffer_load(
-                                    _rsrc(mb("indices")),
-                                    s * topk + k_cl,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                    cache_modifier=CM_DEV,
-                                )
-                            )
+                        if use_indices:
+                            idx = selected_key(s, k_cl)
                         lds_st(attn_keys, lane, index_page_slot(s, idx))
-                    elif const_expr(shared_indices):
-                        idx = fx.Int32(0)
-                        if sparse:
-                            idx = index_page_slot(
+                    elif const_expr(shared_indices and pages is not None):
+                        k_slot = sparse.select(
+                            page_key_slot(k_pos, nkeys, pages), fx.Int32(0)
+                        )
+                        if use_indices:
+                            k_slot = index_page_slot(
                                 s,
                                 fx.Int32(
                                     bo.buffer_load(
@@ -3867,6 +4402,18 @@ def build_ml4_monokernel(
                                     )
                                 ),
                             )
+                        lds_st(attn_keys, lane, k_slot)
+                    elif const_expr(shared_indices):
+                        idx = fx.Int32(0)
+                        if sparse:
+                            pos_k = fx.Int32(
+                                bo.buffer_load(
+                                    r_idx, s * topk + k_cl, vec_width=1, dtype=T.i32
+                                )
+                            )
+                            if const_expr(_DENSE_SHORT):
+                                pos_k = use_indices.select(pos_k, k_cl)
+                            idx = index_page_slot(s, pos_k)
                         lds_st(attn_keys, lane, idx)
                     elif const_expr(use_atom_kv_cache):
                         idx = fx.Int32(0)
@@ -3886,10 +4433,88 @@ def build_ml4_monokernel(
                         lds_st(attn_keys, lane, sparse.select(idx, k_cl))
             return nkeys, sparse
 
+        def gather_old_kv_batched(krows):
+            """``gather_old_kv`` with every row load issued before the first wait.
+            Every lane loads and stores k_pe -- past its lanes, the same bytes
+            to the same LDS words as lane % PE_LANES: a divergent store would
+            draw its loads into the branch, after the latent's wait."""
+            PE_LANES = PE_DIM // 8 if const_expr(cache_fp8) else PE_DIM // 2
+            pe_lane = lane % PE_LANES
+            if const_expr(cache_fp8):
+                rows = [krows[jj] * (QK_DIM // 4) for jj in range(KPW)]
+                kvs = [
+                    fx.Vector(
+                        bo.buffer_load(r_kv, row + lane * 2, vec_width=2, dtype=T.i32)
+                    )
+                    for row in rows
+                ]
+                pes = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            r_pe,
+                            row + KV_LORA // 4 + pe_lane * 2,
+                            vec_width=2,
+                            dtype=T.i32,
+                        )
+                    )
+                    for row in rows
+                ]
+            else:
+                kv_row_words = (
+                    QK_DIM // 2 if const_expr(use_atom_kv_cache) else KV_LORA // 2
+                )
+                kvs = [
+                    fx.Vector(
+                        bo.buffer_load(
+                            r_kv,
+                            kr * kv_row_words + lane * 4,
+                            vec_width=4,
+                            dtype=T.i32,
+                        )
+                    )
+                    for kr in krows
+                ]
+                pes = [
+                    ld_f32(
+                        r_pe,
+                        kr * (QK_DIM // 2) + KV_LORA // 2 + pe_lane
+                        if const_expr(use_atom_kv_cache)
+                        else kr * (PE_DIM // 2) + pe_lane,
+                    )
+                    for kr in krows
+                ]
+            if const_expr(cache_fp8):
+                for jj in range_constexpr(KPW):
+                    fx.ptr_store(
+                        _fp8_to_bf16x8(kvs[jj][0], kvs[jj][1]).bitcast(fx.Float32),
+                        ktile + ((wave * KPW + jj) * KS + lane * 4),
+                    )
+                for jj in range_constexpr(KPW):
+                    fx.ptr_store(
+                        _fp8_to_bf16x8(pes[jj][0], pes[jj][1]).bitcast(fx.Float32),
+                        petile + ((wave * KPW + jj) * PS + pe_lane * 4),
+                    )
+            else:
+                for jj in range_constexpr(KPW):
+                    fx.ptr_store(
+                        kvs[jj].bitcast(fx.Float32),
+                        ktile + ((wave * KPW + jj) * KS + lane * 4),
+                    )
+                for jj in range_constexpr(KPW):
+                    lds_st(petile, (wave * KPW + jj) * PS + pe_lane, pes[jj])
+
         def gather_old_kv():
             """Each wave copies its 8 keys' KV latent (1 KB) + k_pe (128 B) cache rows
             into the LDS tiles (rows of this launch are patched in by patch_new_kv)."""
             krows = [lds_ld(attn_keys, wave * KPW + jj) for jj in range(KPW)]
+            if const_expr(_GATHER_BATCH):
+                gather_old_kv_batched(krows)
+            else:
+                gather_old_kv_serial(krows)
+
+        def gather_old_kv_serial(krows):
+            """``gather_old_kv`` key by key: each key's divergent k_pe load splits
+            the block, so its loads wait one after another."""
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 if const_expr(cache_fp8):
@@ -3937,21 +4562,115 @@ def build_ml4_monokernel(
 
         def patch_new_kv():
             """Rows appended by this launch come from the cache task's kvnew / penew pairs."""
-            if const_expr(use_atom_kv_cache):
+            if const_expr(_SPLIT_PRE):
+                new_slots = [row_slot(new_s, pre=True) for new_s in range(S)]
+                new_active = [sl >= 0 for sl in new_slots]
+            elif const_expr(use_atom_kv_cache):
                 new_active = [row_writes_cache(new_s) for new_s in range(S)]
                 new_slots = [row_slot(new_s) for new_s in range(S)]
-            for jj in range_constexpr(KPW):
-                j = wave * KPW + jj
-                kr = lds_ld(attn_keys, j)
+
+            def key_row(jj):
+                """(the launch row of the wave's key jj, whether it is one)."""
+                kr = lds_ld(attn_keys, wave * KPW + jj)
                 if const_expr(use_atom_kv_cache):
                     sn = fx.Int32(-1)
                     for new_s in range_constexpr(S):
                         match = new_active[new_s] & (kr == new_slots[new_s])
                         sn = match.select(fx.Int32(new_s), sn)
-                    is_new = sn >= 0
+                    return sn, sn >= 0
+                is_new = kr >= pos0
+                return kr - pos0, is_new
+
+            if const_expr(_PATCH_BATCH or GFX942):
+                # the launch row of each of the wave's keys, -1 for an older row
+                sns = []
+                for jj in range_constexpr(KPW):
+                    sn, is_new = key_row(jj)
+                    if const_expr(not use_atom_kv_cache):
+                        sn = is_new.select(sn, fx.Int32(-1))
+                    sns.append(sn)
+            if const_expr(_PATCH_BATCH):
+                patch_new_kv_batched(sns)
+            elif const_expr(GFX942):
+                # every key's row before the first patch, so the key reads and
+                # matches overlap
+                patch_new_kv_serial(lambda jj: (sns[jj], sns[jj] >= 0))
+            else:
+                patch_new_kv_serial(key_row)
+
+        def patch_new_kv_batched(sns):
+            """``patch_new_kv`` in one round trip: a wave holding rows of this
+            launch polls the kvnew / penew pairs of all its keys (or, with fewer
+            launch rows than keys, of all the rows it holds) together, in
+            batches of two all in flight at once; a source the wave does not
+            need polls a needed one's pairs instead."""
+            sn_any = sns[0]
+            for jj in range_constexpr(1, KPW):
+                sn_any = fx.max(sn_any, sns[jj])
+            if sn_any >= 0:
+                pe_lane = lane % (PE_DIM // 2)
+                BY_ROW = S < KPW
+                if const_expr(BY_ROW):
+                    psrcs = []
+                    for r in range_constexpr(S):
+                        held = sns[0] == r
+                        for jj in range_constexpr(1, KPW):
+                            held = held | (sns[jj] == r)
+                        psrcs.append(held.select(fx.Int32(r), sn_any))
                 else:
-                    is_new = kr >= pos0
-                    sn = kr - pos0
+                    psrcs = [
+                        (sns[jj] >= 0).select(sns[jj], sn_any) for jj in range(KPW)
+                    ]
+                pspecs = []
+                for psn in psrcs:
+                    pspecs += [
+                        (mb("kvnew"), psn * KV_LORA + lane * 8 + m * 2, 2)
+                        for m in range(4)
+                    ]
+                    pspecs.append((mb("penew"), psn * PE_DIM + pe_lane * 2, 2))
+                pgroups = [pspecs[g : g + 10] for g in range(0, len(pspecs), 10)]
+                pfirst = [poll_issue(pg) for pg in pgroups]
+                pgot = []
+                for pg, pf in zip(pgroups, pfirst):
+                    pgot += poll(pg, first=pf)
+                for jj in range_constexpr(KPW):
+                    if sns[jj] >= 0:
+                        if const_expr(BY_ROW):
+                            psel = pgot[0:5]
+                            for r in range_constexpr(1, S):
+                                psel = [
+                                    [
+                                        (sns[jj] == r).select(nw, ow)
+                                        for nw, ow in zip(nv, ov)
+                                    ]
+                                    for nv, ov in zip(pgot[r * 5 : r * 5 + 5], psel)
+                                ]
+                        else:
+                            psel = pgot[jj * 5 : jj * 5 + 5]
+                        pkv = [
+                            bf16_pair(
+                                v[0].bitcast(fx.Float32), v[1].bitcast(fx.Float32)
+                            )
+                            for v in psel[0:4]
+                        ]
+                        fx.ptr_store(
+                            fx.Vector.from_elements(pkv, fx.Float32),
+                            ktile + ((wave * KPW + jj) * KS + lane * 4),
+                        )
+                        lds_st(
+                            petile,
+                            (wave * KPW + jj) * PS + pe_lane,
+                            bf16_pair(
+                                psel[4][0].bitcast(fx.Float32),
+                                psel[4][1].bitcast(fx.Float32),
+                            ),
+                        )
+
+        def patch_new_kv_serial(key_row):
+            """``patch_new_kv`` key by key, kvnew then penew."""
+            for jj in range_constexpr(KPW):
+                j = wave * KPW + jj
+                sn, is_new = key_row(jj)
                 if is_new:
                     kvp = get2_many(
                         [
@@ -3968,44 +4687,24 @@ def build_ml4_monokernel(
                         a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
                         lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
 
-        N_HEAD_GROUPS = H // WAVES
-        # ---- the merged head groups (``split_head_merge``)
-        # ``gather_old_kv`` copies the (sample, key-chunk) KV rows into LDS and
-        # closes over nothing else: no ``head_group``, no ``h``. The two tasks
-        # that share an (s, t) and differ only in head group therefore issue
-        # byte-identical gathers -- 384 of the 768 at S=12, each 64 keys x
-        # (KV_LORA + PE_DIM) bytes. The q wait above it is duplicated for the
-        # same reason, and it already waits on all H heads, not this group's.
-        # So let one task own both groups and run them BACK TO BACK.
-        #
-        # Sequential, not simultaneous, and that is the whole feasibility
-        # argument: the PV accumulators are local to a group's body, ``red`` is
-        # rewritten under a barrier, and ``pl`` is already sized for all H
-        # heads. Nothing has to be live across the two, so the register
-        # pressure does not double -- which it would if the groups were
-        # interleaved, and this kernel has no room (239 of 256 VGPRs at S=12).
-        #
-        # Bit-identical outright: no value, order or rounding moves, only which
-        # task computes it. The q staging goes back to covering all H heads at
-        # once, which is what ``QHEADS`` narrows per group -- once over H here
-        # costs exactly what twice over H/2 cost before.
-        SPLIT_MERGE = bool(split_head_merge) and N_HEAD_GROUPS > 1
-        SPLIT_GROUPS = N_HEAD_GROUPS if SPLIT_MERGE else 1
+        # (``SPLIT_MERGE``: the merged head groups, at the build scope)
         SPLIT_QH = H if SPLIT_MERGE else QHEADS
-        for tt in range(
-            start("split"), S * (N_HEAD_GROUPS // SPLIT_GROUPS) * N_SPLIT, G
-        ):
-            tt = fx.Int32(tt)
-            stamp("split", tt, 0)
-            if const_expr(SPLIT_MERGE):
-                s = tt // N_SPLIT
-                hg0 = fx.Int32(0)
-            else:
-                s = tt // (N_HEAD_GROUPS * N_SPLIT)
-                hg0 = (tt // N_SPLIT) % N_HEAD_GROUPS
-            t = tt % N_SPLIT
-            nkeys, sparse = split_keys(t, s)
+
+        def row_nkeys(s):
+            """``split_rows``'s key count of row s."""
+            if const_expr(use_atom_kv_cache):
+                begin, end = row_index_bounds(s)
+                return end - begin
+            return fx.min(pos0 + s + 1, fx.Int32(topk))
+
+        def live_splits(nkeys):
+            """Splits holding keys, at least one (``_SKIP_EMPTY_SPLITS``)."""
+            return fx.max((nkeys + (SPLIT_KEYS - 1)) // SPLIT_KEYS, fx.Int32(1))
+
+        def split_task(tt, s, hg0, t, rows=None, pages=None):
+            nkeys, sparse = split_keys(t, s, rows, pages)
             gpu.barrier()
+            stamp("split", tt, 7)
             gather_old_kv()  # before waiting for q: these rows are from earlier launches
             if const_expr(True):
                 N_PE_T = PE_DIM // Q_B_TILE
@@ -4084,7 +4783,8 @@ def build_ml4_monokernel(
                 hn = head_group * WAVES + fx.min(lane % 16, WAVES - 1)
                 rgk = wave % (SPLIT_KEYS // 16)
                 c = fx.Vector.filled(4, 0.0, fx.Float32)
-                for st in range_constexpr(QK_DIM // 32 // 2):
+
+                def qk_operands(st):
                     kst = ((wave // (SPLIT_KEYS // 16)) % 2) * (QK_DIM // 32 // 2) + st
                     key = rgk * 16 + lane % 16
                     kw = (kst < KV_LORA // 32).select(
@@ -4097,9 +4797,20 @@ def build_ml4_monokernel(
                     b = fx.ptr_load(
                         xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f
                     ).bitcast(fx.BFloat16)
-                    c = fx.Vector(
-                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c])
-                    )
+                    return a, b
+
+                N_QK = QK_DIM // 32 // 2
+                if const_expr(_QK_PIPE):
+                    qk_ab = qk_operands(0)
+                    for st in range_constexpr(N_QK):
+                        qk_cur = qk_ab
+                        if const_expr(st + 1 < N_QK):
+                            qk_ab = qk_operands(st + 1)
+                        c = _mfma_bf16(qk_cur[0], qk_cur[1], c)
+                else:
+                    for st in range_constexpr(N_QK):
+                        a, b = qk_operands(st)
+                        c = _mfma_bf16(a, b, c)
                 if const_expr(SPLIT_KEYS == 64) or wave < 4:
                     fx.ptr_store(c, red + (wave * 64 + lane) * 4)
                 gpu.barrier()
@@ -4158,12 +4869,8 @@ def build_ml4_monokernel(
                         b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(
                             fx.BFloat16
                         )
-                        c0 = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0])
-                        )
-                        c1 = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1])
-                        )
+                        c0 = _mfma_bf16(a, b0, c0)
+                        c1 = _mfma_bf16(a, b1, c1)
                     if lane < 32:
                         for e in range_constexpr(4):
                             hh = split_acc_head(head_group, lane // 16, e)
@@ -4177,6 +4884,29 @@ def build_ml4_monokernel(
                     put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
                 stamp("split", tt, 4)
 
+        def split_pre_pick(s, r):
+            """(``split_rows``, pages) of row s's task in this CTA's split
+            round r, from ``row_pre``."""
+            pg = PRE_TABLES.index("pages") * 16 + 2 * r
+            pages = (read_lane_i32(row_pre, pg), read_lane_i32(row_pre, pg + 1))
+            return split_rows(s, pre=True), pages
+
+        for tt in range(start("split"), N_SPLIT_TASKS, G):
+            tt = fx.Int32(tt)
+            stamp("split", tt, 0)
+            s, hg0, t = split_coords(tt)
+            if const_expr(_SPLIT_PRE):
+                rows, pages = split_pre_pick(s, tt // G)
+                if t < live_splits(rows[0]):  # CTA-uniform
+                    split_task(tt, s, hg0, t, rows, pages)
+            elif const_expr(_SKIP_EMPTY_SPLITS):
+                # the task's own row loads, so a live split waits no longer
+                rows = split_rows(s)
+                if t < live_splits(rows[0]):  # CTA-uniform
+                    split_task(tt, s, hg0, t, rows)
+            else:
+                split_task(tt, s, hg0, t)
+
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
         # 4 row groups x 8 chunks: 2 waves per row group, 4 chunks each
         r_wuv, r_suv = _rsrc(w_uv), _rsrc(s_uv)
@@ -4184,58 +4914,35 @@ def build_ml4_monokernel(
         UV_R = UV_TILE // 16
         UV_WPR = WAVES // UV_R
         UV_UNITS = UV_NKC // (attention_k_chunks_per_unit * UV_WPR)
-        for tt in range(start("uv"), S * N_UV, G):
-            tt = fx.Int32(tt)
-            stamp("uv", tt, 0)
-            s = tt // N_UV  # sample
-            t = tt % N_UV  # global 64-row tile
-            local_t = dcp_local_uv_tile(t, L)
-            head = t // (V_DIM // UV_TILE)
 
-            def u_uv(c):
-                kc = ((wave % UV_WPR) * UV_UNITS + c) * attention_k_chunks_per_unit
-                return unit_attention(
-                    r_wuv,
-                    r_suv,
-                    local_t * UV_R + wave // UV_WPR,
-                    kc,
-                    UV_NKC,
-                    KV_LORA,
-                    128,
-                    attention_b_word(kc * 64),
-                    scale_rows=uv_scale_rows,
-                    coef=(
-                        (lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2))
-                        if const_expr(attention_ptpc)
-                        else None
-                    ),
-                )
-
-            pre = [u_uv(c) for c in range(UV_UNITS)]
-            hint_wait(
-                N_SPLIT,
-                lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head),
-                mark=("uv", tt),
-            )
-            pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
-            stamp("uv", tt, 5)
+        def uv_merge_whole(s, head, n_live, tt):
+            """LDS xs = the head's merged latent (bf16 pairs; PTPC: FP8 + scales)."""
             # Four 16-split quarters keep each poll and its live payload bounded.
             # Every thread owns one (quarter, half-of-latent) pair and processes
             # its two latent-pair positions sequentially; red holds quarter sums.
             SPH = N_SPLIT // 4
             dp_lo = tid % (KV_LORA // 4)
             hf = tid // (KV_LORA // 4)
-            spi = fx.min(lane, N_SPLIT - 1)
+            spi = fx.min(lane, n_live - 1)
             ml = (s * N_SPLIT + spi) * H + head
+
+            def acc_split(j):
+                # a skipped split reads the last live one's (cached) partial sum
+                # instead, at weight 0
+                if const_expr(_SKIP_EMPTY_SPLITS):
+                    return s * N_SPLIT + fx.min(hf * SPH + j, n_live - 1)
+                return s * N_SPLIT + hf * SPH + j
+
             ml_got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)])
+            stamp("uv", tt, 6)
             if wave == 0:  # per-split weights exp(m - M) / L for this head -> misc[sp]
-                ok_sp = lane < N_SPLIT
+                ok_sp = lane < n_live
                 m_sp = ok_sp.select(ml_got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
                 l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
                 m_all = wave_max(m_sp)
                 w_sp = _exp(m_sp - m_all)
                 den = wave_sum(l_sp * w_sp)
-                if ok_sp:
+                if lane < N_SPLIT:
                     lds_st(
                         misc,
                         lane,
@@ -4245,14 +4952,14 @@ def build_ml4_monokernel(
                     lds_st(misc, N_SPLIT, m_all)
                     lds_st(misc, N_SPLIT + 1, den)
             gpu.barrier()
+            stamp("uv", tt, 7)
             for dh in range_constexpr(2):
                 dp = dp_lo + dh * (KV_LORA // 4)
                 got = poll(
                     [
                         (
                             mb("sp_acc"),
-                            ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2)
-                            + dp,
+                            (acc_split(j) * H + head) * (KV_LORA // 2) + dp,
                             1,
                         )
                         for j in range(SPH)
@@ -4282,7 +4989,7 @@ def build_ml4_monokernel(
             if const_expr(attention_ptpc):
                 uv_max = wave_max(
                     uv_valid.select(
-                        fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)
+                        fmax(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)
                     )
                 )
                 if (lane == 0) & (wave < KV_LORA // 128):
@@ -4304,6 +5011,123 @@ def build_ml4_monokernel(
                         div_rn(uv1, uv_scale, uv_rcp),
                     )
                 gpu.barrier()
+
+        UV_QUARTERS = V_DIM // UV_TILE  # tasks a head = latent slices
+        UV_QP = KV_LORA // 2 // UV_QUARTERS  # latent pairs a slice: one a lane
+        UV_SPW = N_SPLIT // WAVES  # splits a wave merges
+
+        def uv_merge_slice(s, t, head, n_live, tt):
+            """LDS xs = the head's merged latent (bf16 pairs): this task merges
+            latent slice q = its V tile (wave w: splits w * UV_SPW .. + UV_SPW,
+            lane: a latent pair), publishes it to `lat` and gathers the others."""
+            q = t % UV_QUARTERS
+            k0 = wave * UV_SPW
+            lat_row = (s * H + head) * (KV_LORA // 2)
+            o0 = fx.Float32(0.0)
+            o1 = fx.Float32(0.0)
+            if k0 < n_live:  # wave-uniform: a wave of dead splits loads nothing
+                # every wave weighs all the splits (lane = split) itself: no
+                # barrier between the poll and the sums; a dead split reads the
+                # last live one's partial sum at weight 0
+                ml = (s * N_SPLIT + fx.min(lane, n_live - 1)) * H + head
+                got = poll(
+                    [(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)]
+                    + [
+                        (
+                            mb("sp_acc"),
+                            ((s * N_SPLIT + fx.min(k0 + j, n_live - 1)) * H + head)
+                            * (KV_LORA // 2)
+                            + q * UV_QP
+                            + lane,
+                            1,
+                        )
+                        for j in range(UV_SPW)
+                    ]
+                )
+                ok_sp = lane < n_live
+                m_sp = ok_sp.select(got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                l_sp = ok_sp.select(got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                m_all = wave_max(m_sp)
+                w_sp = _exp(m_sp - m_all)
+                den = wave_sum(l_sp * w_sp)
+                w_sp = w_sp * (den > 0.0).select(_rcp(den), fx.Float32(0.0))
+                for j in range_constexpr(UV_SPW):
+                    wj = bpermute_i32((k0 + j) * 4, w_sp.bitcast(fx.Int32)).bitcast(
+                        fx.Float32
+                    )
+                    a0, a1 = bf2_f32(got[2 + j][0])
+                    o0 = o0 + a0 * wj
+                    o1 = o1 + a1 * wj
+            stamp("uv", tt, 6)
+            lds_st(red, (wave * UV_QP + lane) * 2, o0)
+            lds_st(red, (wave * UV_QP + lane) * 2 + 1, o1)
+            gpu.barrier()
+            if tid < UV_QP:
+                u0 = lds_ld(red, tid * 2)
+                u1 = lds_ld(red, tid * 2 + 1)
+                for w in range_constexpr(1, WAVES):
+                    u0 = u0 + lds_ld(red, (w * UV_QP + tid) * 2)
+                    u1 = u1 + lds_ld(red, (w * UV_QP + tid) * 2 + 1)
+                u0, u1 = bf16_round(u0), bf16_round(u1)
+                put_bf(mb("lat"), (lat_row + q * UV_QP + tid) * 2, [u0, u1])
+                lds_st(xs, q * UV_QP + tid, bf16_pair(u0, u1))
+            # the other slices, two pairs a thread
+            if tid < (UV_QUARTERS - 1) * (UV_QP // 2):
+                p = ((q + 1 + tid // (UV_QP // 2)) % UV_QUARTERS) * UV_QP + (
+                    tid % (UV_QP // 2)
+                ) * 2
+                v = poll([(mb("lat"), lat_row + p, 2)])[0]
+                lds_st(xs, p, v[0].bitcast(fx.Float32))
+                lds_st(xs, p + 1, v[1].bitcast(fx.Float32))
+            gpu.barrier()
+            stamp("uv", tt, 7)
+
+        for tt in range(start("uv"), S * N_UV, G):
+            tt = fx.Int32(tt)
+            stamp("uv", tt, 0)
+            s = tt // N_UV  # sample
+            t = tt % N_UV  # global 64-row tile
+            local_t = dcp_local_uv_tile(t, L)
+            head = t // (V_DIM // UV_TILE)
+
+            def u_uv(c):
+                kc = ((wave % UV_WPR) * UV_UNITS + c) * attention_k_chunks_per_unit
+                return unit_attention(
+                    r_wuv,
+                    r_suv,
+                    local_t * UV_R + wave // UV_WPR,
+                    kc,
+                    UV_NKC,
+                    KV_LORA,
+                    128,
+                    attention_b_word(kc * 64),
+                    scale_rows=uv_scale_rows,
+                    coef=(
+                        (lambda: lds_ld(misc, N_SPLIT + 2 + kc // 2))
+                        if const_expr(attention_ptpc)
+                        else None
+                    ),
+                )
+
+            # loaded ahead of the weight prefetch: loads retire in order, so a
+            # wait on it after the prefetch would wait for the whole tile
+            n_live = (
+                live_splits(row_nkeys(s)) if const_expr(_SKIP_EMPTY_SPLITS) else N_SPLIT
+            )
+            if const_expr(_SKIP_EMPTY_SPLITS):
+                rocdl.sched_barrier(0)
+            pre = [u_uv(c) for c in range(UV_UNITS)]
+            hint_wait(
+                N_SPLIT,
+                lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head),
+                mark=("uv", tt),
+            )
+            pre_poll(n_live, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
+            stamp("uv", tt, 5)
+            if const_expr(_UV_SLICE):
+                uv_merge_slice(s, t, head, n_live, tt)
+            else:
+                uv_merge_whole(s, head, n_live, tt)
             # Debug stamp placed HERE, not after the per-split weights where it
             # used to sit, so ``timeline_report``'s "stage" and "compute" cut
             # this stage where the question is: everything above reconstructs
@@ -4545,6 +5369,7 @@ def build_ml4_monokernel(
             if expert_mxfp4
             else 2 * expert_inter // SCALE_BM * (HIDDEN // 128) * 4
         )
+        hoist_shared_ptrs()
 
         if const_expr(S == 1):
             # Each CTA handles one eight-intermediate tile per task round;
@@ -4555,39 +5380,49 @@ def build_ml4_monokernel(
             N_UG1 = TOP_K * (
                 expert_inter // UG8
             )  # TOP_K = 8 makes this == expert_inter
-            for u in range(start("ug"), N_UG1, G):
-                u = fx.Int32(u)
-                stamp("ug", u, 0)
-                s_u, c = fx.Int32(0), u % (expert_inter // UG8)
-                has_sh = u < expert_inter // UG8
-                slot = has_sh.select(
-                    fx.Int32(MOE_SLOTS - 1), u // (expert_inter // UG8)
-                )
-                # the FP8 activation is computed here from the post-attention state (in
-                # parallel with the router): RMSNorm, then per-128 quant with one wave per
-                # block -> X[0] (fp8 values in bf16), block scales -> misc[8:]
-                NB = XQ_BLOCKS // WAVES
-                ks_ = [(wave + j * WAVES) * 128 + lane * 2 for j in range(NB)]
-                r_gp = _rsrc(g_post)
-                gps = [
-                    (ld_bf16(r_gp, k), ld_bf16(r_gp, k + 1)) for k in ks_
-                ]  # issued ahead of the wait
-                bs = load_bias()
-                w_rg = (
-                    c
-                    if paired_ug_rows
-                    else ((lane % 16) // 8) * (expert_inter // 16) + c // 2
-                )  # MFMA rows 0-7 gate, 8-15 up
-                w_ln = (
-                    lane if paired_ug_rows else (lane & -16) | ((c % 2) * 8 + lane % 8)
-                )
-                s_rg = (lane // 32) * (
-                    expert_inter // 16
-                ) + c // 2  # this lane's output rows
+            if const_expr(_UG1_FUSE and N_UG1 > G):
+                # TP8: 384 tasks over 256 CTAs. A CTA's tasks share one staging
+                # of the activation and one routing, and the routed weight tiles
+                # of all of them are in flight together instead of one round
+                # after the other (round 2 used to re-stage for ~6.6 us).
+                UG1_ROUNDS = (N_UG1 + G - 1) // G
+                UG1_C = expert_inter // UG8
+                u_first = start("ug")
+                s_u = fx.Int32(0)
+                tasks1 = []
+                for r in range_constexpr(UG1_ROUNDS):
+                    u = fx.Int32(u_first + r * G)
+                    live = None if r == 0 else u < N_UG1
+                    if const_expr(UG_SHIFT):
+                        u = (u + UG_SHIFT) % N_UG1
+                    c = u % UG1_C
+                    tasks1.append(
+                        dict(
+                            u=u,
+                            live=live,
+                            c=c,
+                            slot=(u < UG1_C).select(
+                                fx.Int32(MOE_SLOTS - 1), u // UG1_C
+                            ),
+                            w_rg=((lane % 16) // 8) * (expert_inter // 16) + c // 2,
+                            w_ln=(lane & -16) | ((c % 2) * 8 + lane % 8),
+                            s_rg=(lane // 32) * (expert_inter // 16) + c // 2,
+                        )
+                    )
+                # Only round 0 can carry the shared expert: later rounds start
+                # at G or past it, and every logical task < UG1_C is in round 0.
+                has_sh = tasks1[0]["u"] < UG1_C
 
-                def u_ug8(
-                    cc, e, live=None
-                ):  # expert e's weights (loads return 0 unless live)
+                def stamp1(t, which):
+                    if const_expr(timeline):
+                        if const_expr(t["live"] is None):
+                            stamp("ug", t["u"], which)
+                        else:
+                            live = t["live"]
+                            if live:
+                                stamp("ug", t["u"], which)
+
+                def u_ug1(t, cc, e, live=None):
                     nw = (
                         None
                         if live is None
@@ -4604,35 +5439,12 @@ def build_ml4_monokernel(
                     r_sug = bo.create_buffer_resource_from_addr(
                         expert_addr(s_ug, e, UG_S_BYTES, 1), num_records_bytes=ns
                     )
-                    unit = wave * (UG8_CPW // 2) + cc
-                    kc = unit * 2
-                    if const_expr(expert_mxfp4):
-                        if const_expr(native_fp4_mfma):
-                            return unit_native_mxfp4(
-                                r_wug,
-                                r_sug,
-                                w_rg,
-                                unit,
-                                HIDDEN,
-                                unit * 32,
-                                8 + unit * 4 + lane // 16,
-                                ln=w_ln,
-                            )
-                        return unit_mxfp4(
-                            r_wug,
-                            r_sug,
-                            w_rg,
-                            unit,
-                            HIDDEN,
-                            unit * 32,
-                            lambda: _uniform_f32(lds_ld(misc, 8 + unit)),
-                            w_ln,
-                        )
+                    kc = (wave * (UG8_CPW // 2) + cc) * 2
                     wv = [
                         fx.Vector(
                             bo.buffer_load(
                                 r_wug,
-                                ((w_rg * UG_NKC + kc + h) * 64 + w_ln) * 4,
+                                ((t["w_rg"] * UG_NKC + kc + h) * 64 + t["w_ln"]) * 4,
                                 vec_width=4,
                                 dtype=T.i32,
                             )
@@ -4640,7 +5452,8 @@ def build_ml4_monokernel(
                         for h in range(2)
                     ]
                     sc = ld_f32(
-                        r_sug, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2
+                        r_sug,
+                        (t["s_rg"] * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2,
                     )
                     return (
                         "f8f8",
@@ -4649,19 +5462,22 @@ def build_ml4_monokernel(
                         kc * 16 + (lane // 16) * 4,
                     )
 
-                # the shared expert's weights do not depend on routing: prefetch them (the
-                # later zero-weight MMAs of the other tasks are cheaper than a branch)
+                for t in tasks1:
+                    stamp1(t, 0)
+                NB = XQ_BLOCKS // WAVES
+                ks_ = [(wave + j * WAVES) * 128 + lane * 2 for j in range(NB)]
+                r_gp = _rsrc(g_post)
+                gps = [(ld_bf16(r_gp, k), ld_bf16(r_gp, k + 1)) for k in ks_]
+                bs = load_bias()
                 pre = [
-                    u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh)
+                    u_ug1(tasks1[0], cc, fx.Int32(SHARED_EXPERT), has_sh)
                     for cc in range(UG8_CPW // 2)
                 ]
                 hint_wait(
                     N_ROW_TILES,
                     lambda k: (mb("a"), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1),
-                    mark=("ug", u),
+                    mark=("ug", tasks1[0]["u"]),
                 )
-                # the sum of squares takes the router's element partition and order
-                # (stage_x_rmsnorm), so rstd -- and every FP8 rounding -- is bit-identical
                 NQ4 = HIDDEN // (4 * THREADS)
                 got = poll(
                     [
@@ -4677,71 +5493,286 @@ def build_ml4_monokernel(
                         ss = ss + a * a
                 rstd = _rsq(block_sum(ss) * (1.0 / HIDDEN) + EPS)
                 for j in range_constexpr(NB):
-                    if const_expr(native_fp4_mfma):
-                        q0, q1, qs = quant_mxfp8(
-                            av[j][0] * rstd * gps[j][0],
-                            av[j][1] * rstd * gps[j][1],
-                        )
-                        st_mxfp8(ks_[j], q0, q1)
-                        if lane % 16 == 0:
-                            lds_st(
-                                misc,
-                                8 + (wave + j * WAVES) * 4 + lane // 16,
-                                qs.bitcast(fx.Float32),
-                            )
-                    else:
-                        q0, q1, qs = quant_scaled(
-                            av[j][0] * rstd * gps[j][0],
-                            av[j][1] * rstd * gps[j][1],
-                        )
-                        st_f8(ks_[j], q0, q1)
-                        if lane == 0:
-                            lds_st(misc, 8 + wave + j * WAVES, qs)
+                    q0, q1, qs = quant_scaled(
+                        av[j][0] * rstd * gps[j][0],
+                        av[j][1] * rstd * gps[j][1],
+                    )
+                    st_f8(ks_[j], q0, q1)
+                    if lane == 0:
+                        lds_st(misc, 8 + wave + j * WAVES, qs)
+                # with `_DN_ROUTE_REUSE` the down stage's full table lives in
+                # keys[0, MOE_SLOTS), so this CTA's own picks go past it
+                KEY1 = MOE_SLOTS if const_expr(_DN_ROUTE_REUSE) else 0
                 if wave == 0:
                     e, w = route_top8(s_u, bs=bs)
-                    if lane == slot - 1:
-                        lds_st(keys, 0, e)
-                        lds_st(misc, 0, w)
-                stamp("ug", u, 2)
+                    for r in range_constexpr(UG1_ROUNDS):
+                        if lane == tasks1[r]["slot"] - 1:
+                            lds_st(keys, KEY1 + r, e)
+                            lds_st(misc, r, w)
+                    if const_expr(_DN_ROUTE_REUSE):
+                        if lane < MOE_SLOTS:  # `dn_route`'s table, from the same picks
+                            q = (lane + 1) % MOE_SLOTS
+                            lds_st(
+                                keys,
+                                q,
+                                (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e),
+                            )
+                            lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
+                for t in tasks1:
+                    stamp1(t, 2)
                 gpu.barrier()
-                e_sel = _uniform(lds_ld(keys, 0))
-                post = [u_ug8(cc, e_sel) for cc in range(UG8_CPW // 2)]
+                e_sels = [_uniform(lds_ld(keys, KEY1 + r)) for r in range(UG1_ROUNDS)]
+                posts = [
+                    [u_ug1(t, cc, e_sels[r], t["live"]) for cc in range(UG8_CPW // 2)]
+                    for r, t in enumerate(tasks1)
+                ]
                 reduce_rows(
                     1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
                 )
                 gpu.barrier()
-                reduce_rows(
-                    1,
-                    mma_units([fx.Float32(0.0) for _ in range(4)], post),
-                    lambda rl, n, v: lds_st(outs, 16 + rl, v),
-                )
-                stamp("ug", u, 3)
-                gpu.barrier()
-                if (
-                    tid < UG8
-                ):  # threads 0-3: the shared expert's rows, 4-7: the routed slot's
-                    r = (tid % (UG8 // 2)) * 2
-                    o = (tid // (UG8 // 2)) * 16
-                    g0, g1 = lds_ld(outs, o + r), lds_ld(outs, o + r + 1)
-                    u0, u1 = lds_ld(outs, o + UG8 + r), lds_ld(outs, o + UG8 + r + 1)
-                    if has_sh | (tid >= UG8 // 2):
-                        put2(
-                            mb("mid"),
-                            (tid < UG8 // 2).select(fx.Int32(0), slot) * expert_inter
-                            + c * UG8
-                            + r,
-                            g0 * _rcp(1.0 + _exp(-g0)) * u0,
-                            g1 * _rcp(1.0 + _exp(-g1)) * u1,
+                for r in range_constexpr(UG1_ROUNDS):
+
+                    def ug1_task(r=r, t=tasks1[r]):
+                        reduce_rows(
+                            1,
+                            mma_units([fx.Float32(0.0) for _ in range(4)], posts[r]),
+                            lambda rl, n, v: lds_st(outs, 16 + rl, v),
                         )
-                if (c == 0) & (tid == 0):  # routing record (debug / tests)
-                    put(mb("sel"), slot, e_sel)
-                    put(mb("prob"), slot, lds_ld(misc, 0))
-                    if has_sh:
-                        put(mb("sel"), 0, fx.Int32(SHARED_EXPERT))
-                        put(mb("prob"), 0, fx.Float32(1.0))
-                stamp("ug", u, 4)
-                if const_expr(N_UG1 > G):
+                        stamp1(t, 3)
+                        gpu.barrier()
+                        if tid < UG8:
+                            rr = (tid % (UG8 // 2)) * 2
+                            o = (tid // (UG8 // 2)) * 16
+                            g0, g1 = lds_ld(outs, o + rr), lds_ld(outs, o + rr + 1)
+                            v0 = lds_ld(outs, o + UG8 + rr)
+                            v1 = lds_ld(outs, o + UG8 + rr + 1)
+                            emit = tid >= UG8 // 2
+                            if const_expr(r == 0):
+                                emit = has_sh | emit
+                            if emit:
+                                put2(
+                                    mb("mid"),
+                                    (tid < UG8 // 2).select(fx.Int32(0), t["slot"])
+                                    * expert_inter
+                                    + t["c"] * UG8
+                                    + rr,
+                                    g0 * _rcp(1.0 + _exp(-g0)) * v0,
+                                    g1 * _rcp(1.0 + _exp(-g1)) * v1,
+                                )
+                        if (t["c"] == 0) & (tid == 0):  # routing record (debug / tests)
+                            put(mb("sel"), t["slot"], e_sels[r])
+                            put(mb("prob"), t["slot"], lds_ld(misc, r))
+                            if const_expr(r == 0):
+                                if has_sh:
+                                    put(mb("sel"), 0, fx.Int32(SHARED_EXPERT))
+                                    put(mb("prob"), 0, fx.Float32(1.0))
+                        stamp1(t, 4)
+
+                    if const_expr(r == 0):
+                        ug1_task()
+                    else:
+                        live = tasks1[r]["live"]
+                        if live:  # CTA-uniform: the task's barriers stay matched
+                            ug1_task()
+                gpu.barrier()
+            else:
+                for u in range(start("ug"), N_UG1, G):
+                    u = fx.Int32(u)
+                    if const_expr(UG_SHIFT):
+                        u = (u + UG_SHIFT) % N_UG1
+                    stamp("ug", u, 0)
+                    s_u, c = fx.Int32(0), u % (expert_inter // UG8)
+                    has_sh = u < expert_inter // UG8
+                    slot = has_sh.select(
+                        fx.Int32(MOE_SLOTS - 1), u // (expert_inter // UG8)
+                    )
+                    # the FP8 activation is computed here from the post-attention state (in
+                    # parallel with the router): RMSNorm, then per-128 quant with one wave per
+                    # block -> X[0] (fp8 values in bf16), block scales -> misc[8:]
+                    NB = XQ_BLOCKS // WAVES
+                    ks_ = [(wave + j * WAVES) * 128 + lane * 2 for j in range(NB)]
+                    r_gp = _rsrc(g_post)
+                    gps = [
+                        (ld_bf16(r_gp, k), ld_bf16(r_gp, k + 1)) for k in ks_
+                    ]  # issued ahead of the wait
+                    bs = load_bias()
+                    w_rg = (
+                        c
+                        if paired_ug_rows
+                        else ((lane % 16) // 8) * (expert_inter // 16) + c // 2
+                    )  # MFMA rows 0-7 gate, 8-15 up
+                    w_ln = (
+                        lane
+                        if paired_ug_rows
+                        else (lane & -16) | ((c % 2) * 8 + lane % 8)
+                    )
+                    s_rg = (lane // 32) * (
+                        expert_inter // 16
+                    ) + c // 2  # this lane's output rows
+
+                    def u_ug8(
+                        cc, e, live=None
+                    ):  # expert e's weights (loads return 0 unless live)
+                        nw = (
+                            None
+                            if live is None
+                            else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
+                        )
+                        ns = (
+                            None
+                            if live is None
+                            else live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
+                        )
+                        r_wug = bo.create_buffer_resource_from_addr(
+                            expert_addr(w_ug, e, UG_W_BYTES, 0), num_records_bytes=nw
+                        )
+                        r_sug = bo.create_buffer_resource_from_addr(
+                            expert_addr(s_ug, e, UG_S_BYTES, 1), num_records_bytes=ns
+                        )
+                        unit = wave * (UG8_CPW // 2) + cc
+                        kc = unit * 2
+                        if const_expr(expert_mxfp4):
+                            if const_expr(native_fp4_mfma):
+                                return unit_native_mxfp4(
+                                    r_wug,
+                                    r_sug,
+                                    w_rg,
+                                    unit,
+                                    HIDDEN,
+                                    unit * 32,
+                                    8 + unit * 4 + lane // 16,
+                                    ln=w_ln,
+                                )
+                            return unit_mxfp4(
+                                r_wug,
+                                r_sug,
+                                w_rg,
+                                unit,
+                                HIDDEN,
+                                unit * 32,
+                                lambda: _uniform_f32(lds_ld(misc, 8 + unit)),
+                                w_ln,
+                            )
+                        wv = [
+                            fx.Vector(
+                                bo.buffer_load(
+                                    r_wug,
+                                    ((w_rg * UG_NKC + kc + h) * 64 + w_ln) * 4,
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                )
+                            )
+                            for h in range(2)
+                        ]
+                        sc = ld_f32(
+                            r_sug, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2
+                        )
+                        return (
+                            "f8f8",
+                            wv,
+                            lambda: sc * _uniform_f32(lds_ld(misc, 8 + kc // 2)),
+                            kc * 16 + (lane // 16) * 4,
+                        )
+
+                    # the shared expert's weights do not depend on routing: prefetch them (the
+                    # later zero-weight MMAs of the other tasks are cheaper than a branch)
+                    pre = [
+                        u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh)
+                        for cc in range(UG8_CPW // 2)
+                    ]
+                    hint_wait(
+                        N_ROW_TILES,
+                        lambda k: (mb("a"), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1),
+                        mark=("ug", u),
+                    )
+                    # the sum of squares takes the router's element partition and order
+                    # (stage_x_rmsnorm), so rstd -- and every FP8 rounding -- is bit-identical
+                    NQ4 = HIDDEN // (4 * THREADS)
+                    got = poll(
+                        [
+                            (mb("a"), (s_u * HIDDEN + (tid + i * THREADS) * 4) // 2, 2)
+                            for i in range(NQ4)
+                        ]
+                        + [(mb("a"), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
+                    )
+                    av = [bf2_f32(w[0]) for w in got[NQ4:]]
+                    ss = fx.Float32(0.0)
+                    for w in got[:NQ4]:
+                        for a in list(bf2_f32(w[0])) + list(bf2_f32(w[1])):
+                            ss = ss + a * a
+                    rstd = _rsq(block_sum(ss) * (1.0 / HIDDEN) + EPS)
+                    for j in range_constexpr(NB):
+                        if const_expr(native_fp4_mfma):
+                            q0, q1, qs = quant_mxfp8(
+                                av[j][0] * rstd * gps[j][0],
+                                av[j][1] * rstd * gps[j][1],
+                            )
+                            st_mxfp8(ks_[j], q0, q1)
+                            if lane % 16 == 0:
+                                lds_st(
+                                    misc,
+                                    8 + (wave + j * WAVES) * 4 + lane // 16,
+                                    qs.bitcast(fx.Float32),
+                                )
+                        else:
+                            q0, q1, qs = quant_scaled(
+                                av[j][0] * rstd * gps[j][0],
+                                av[j][1] * rstd * gps[j][1],
+                            )
+                            st_f8(ks_[j], q0, q1)
+                            if lane == 0:
+                                lds_st(misc, 8 + wave + j * WAVES, qs)
+                    if wave == 0:
+                        e, w = route_top8(s_u, bs=bs)
+                        if lane == slot - 1:
+                            lds_st(keys, 0, e)
+                            lds_st(misc, 0, w)
+                    stamp("ug", u, 2)
                     gpu.barrier()
+                    e_sel = _uniform(lds_ld(keys, 0))
+                    post = [u_ug8(cc, e_sel) for cc in range(UG8_CPW // 2)]
+                    reduce_rows(
+                        1,
+                        mma_units([fx.Float32(0.0) for _ in range(4)], pre),
+                        emit_out(16),
+                    )
+                    gpu.barrier()
+                    reduce_rows(
+                        1,
+                        mma_units([fx.Float32(0.0) for _ in range(4)], post),
+                        lambda rl, n, v: lds_st(outs, 16 + rl, v),
+                    )
+                    stamp("ug", u, 3)
+                    gpu.barrier()
+                    if (
+                        tid < UG8
+                    ):  # threads 0-3: the shared expert's rows, 4-7: the routed slot's
+                        r = (tid % (UG8 // 2)) * 2
+                        o = (tid // (UG8 // 2)) * 16
+                        g0, g1 = lds_ld(outs, o + r), lds_ld(outs, o + r + 1)
+                        u0, u1 = (
+                            lds_ld(outs, o + UG8 + r),
+                            lds_ld(outs, o + UG8 + r + 1),
+                        )
+                        if has_sh | (tid >= UG8 // 2):
+                            put2(
+                                mb("mid"),
+                                (tid < UG8 // 2).select(fx.Int32(0), slot)
+                                * expert_inter
+                                + c * UG8
+                                + r,
+                                g0 * _rcp(1.0 + _exp(-g0)) * u0,
+                                g1 * _rcp(1.0 + _exp(-g1)) * u1,
+                            )
+                    if (c == 0) & (tid == 0):  # routing record (debug / tests)
+                        put(mb("sel"), slot, e_sel)
+                        put(mb("prob"), slot, lds_ld(misc, 0))
+                        if has_sh:
+                            put(mb("sel"), 0, fx.Int32(SHARED_EXPERT))
+                            put(mb("prob"), 0, fx.Float32(1.0))
+                    stamp("ug", u, 4)
+                    if const_expr(N_UG1 > G):
+                        gpu.barrier()
         elif const_expr(S > 1):
             # One eight-intermediate tile per CTA and task round. Shared-expert weights
             # feed all sample columns of one MFMA, while routed-expert weights are
@@ -4750,8 +5781,9 @@ def build_ml4_monokernel(
             UG8 = 8
             UG8_UNITS = (HIDDEN // 128) // WAVES
             XW = XQ_X_STRIDE
-            dn_route(load_bias())
-            gpu.barrier()
+            if const_expr(not _UG_SH_EARLY):  # else `ug_flat` routes after them
+                dn_route(load_bias())
+                gpu.barrier()
             ug_n = fx.Int32(0)
             if const_expr(moe_dedup):
                 # ---- the expert-group table.
@@ -4831,13 +5863,16 @@ def build_ml4_monokernel(
             # Same number of rounds either way: ``2 * S`` (sample) rounds become
             # ``2 * S`` (group) rounds, of which only ``ug_n`` carry work.
             # Per-sample schedule: TOP_K * UG_C tasks (top-8: == inter; ug_task_rounds assumed that).
+            # They need not fill whole CTA rounds: TP8's 384 leave the last
+            # round to the first UG_TASKS % G CTAs of the rotation.
             UG_TASKS = TOP_K * UG_C
-            assert moe_dedup or UG_TASKS % G == 0, (
-                "the per-sample up/gate schedule needs whole CTA rounds"
-            )
-            UG_ROUNDS = UG_ROUTED * UG_C // G if moe_dedup else UG_TASKS // G
-            for task_round in range_constexpr(UG_ROUNDS):
+            UG_ROUNDS = UG_ROUTED * UG_C // G if moe_dedup else (UG_TASKS + G - 1) // G
+            ug_carry = {}
+
+            def ug_round(task_round):
                 u = fx.Int32(u0 + task_round * G)
+                if const_expr(UG_SHIFT):
+                    u = (u + UG_SHIFT) % UG_TASKS
                 c = u % UG_C
                 has_sh = u < UG_C
                 group = u // UG_C  # moe_dedup: a DISTINCT expert, not a slot
@@ -5043,10 +6078,10 @@ def build_ml4_monokernel(
                             _uniform(lds_ld(grp, GRP_EXP + group)), None, live
                         )
                     else:
-                        cur = ug_ahead  # type: ignore[has-type]  # noqa: F821  (bound by the previous unrolled round)
+                        cur = ug_carry.pop("ahead")  # issued by the previous round
                     if const_expr(task_round + 1 < UG_ROUNDS):
                         ahead = group + G // UG_C
-                        ug_ahead = ug8_units(  # noqa: F841
+                        ug_carry["ahead"] = ug8_units(
                             _uniform(lds_ld(grp, GRP_EXP + ahead)), None, ahead < ug_n
                         )
                 else:
@@ -5110,7 +6145,11 @@ def build_ml4_monokernel(
                         # it where the four candidate causes separate: issuing the
                         # next sample's weight loads, the MFMA chain and its LDS
                         # reduction, the CTA barrier, and the `mid` mailbox write.
-                        stamp("ug", sample * expert_inter + u, 0)
+                        # One timeline row a task: column 0 is the first
+                        # sample's start and 4 the last one's end, 1-3 the last
+                        # sample's split.
+                        if const_expr(sample == 0):
+                            stamp("ug", u, 0)
                         pre = ug_q.pop(0)
                         ahead = sample + ug_prefetch
                         if const_expr(ahead < S):
@@ -5120,7 +6159,7 @@ def build_ml4_monokernel(
                                     ahead,
                                 )
                             )
-                        stamp("ug", sample * expert_inter + u, 1)  # weight loads issued
+                        stamp("ug", u, 1)  # weight loads issued
                         # Cut BETWEEN the MFMA chain and `reduce_rows`, which
                         # carries a barrier of its own. Folded together they
                         # read as one 1.0 us bucket that was taken for load
@@ -5133,16 +6172,328 @@ def build_ml4_monokernel(
                         # together, and the barrier costs the slowest. Skew is
                         # a load-balancing problem, not a prefetch one.
                         ug_acc = mma_units([fx.Float32(0.0) for _ in range(4)], pre)
-                        stamp("ug", sample * expert_inter + u, 2)  # MFMA chain alone
+                        stamp("ug", u, 2)  # MFMA chain alone
                         reduce_rows(1, ug_acc, emit_out(16))
                         gpu.barrier()
-                        stamp(
-                            "ug", sample * expert_inter + u, 3
-                        )  # reduction + both barriers
+                        stamp("ug", u, 3)  # reduction + both barriers
                         ug8_emit(sample, False)
-                        stamp("ug", sample * expert_inter + u, 4)  # mid mailbox write
+                        if const_expr(sample == S - 1):
+                            stamp("ug", u, 4)  # mid mailbox write
                 if const_expr(task_round + 1 < UG_ROUNDS):
                     gpu.barrier()
+
+            def ug_flat():
+                """One stream of (sample, slot, column tile) units per CTA.
+
+                The task rounds give a CTA S tiles per round, so TP8's
+                384 tasks leave the second round on half the CTAs -- and a
+                CTA streams at about the same rate whether its neighbours are
+                busy or not, so that round runs at half the bandwidth. Units
+                0 .. UG_C - 1 are the shared expert's column tiles (all S
+                samples in one MFMA), the rest the routed (sample, slot, c)
+                tiles; CTA b takes units b, b + G, ... with the next unit's
+                tile in flight while it computes the current one. Every unit
+                is the same MFMA chain, reduction and emit as in `ug_round`.
+                """
+                N_FLAT = UG_C + S * UG_TASKS
+                R_FLAT = (N_FLAT + G - 1) // G
+                # _UG_SH_EARLY: the routed units alone, rotated so that a CTA's
+                # first one is the unit it ran after its shared one before
+                N_RT = S * UG_TASKS
+                R_RT = (N_RT + G - 1) // G
+                h0 = (u0 + (G - UG_C)) & (G - 1)
+
+                def ug_groups_wave():
+                    """The step's expert groups: group g is the g-th distinct
+                    routed expert in id order, stored at `grp[g]`.
+
+                    Lane p < UG_ROUTED takes routed pick p (sample p // TOP_K,
+                    slot p % TOP_K + 1); its expert's group is the popcount of
+                    the wave's expert bitmap below it. Every wave stores the
+                    same words, so none waits on another. Returns the count."""
+                    p = fx.min(lane, UG_ROUTED - 1)
+                    e = lds_ld(keys, (p // TOP_K) * MOE_SLOTS + p % TOP_K + 1)
+                    ew, eb = e.shrui(fx.Int32(5)), e & 31
+                    words = [
+                        wave_or_dpp((ew == w).select(fx.Int32(1) << eb, fx.Int32(0)))
+                        for w in range(N_EXPERTS // 32)
+                    ]
+                    counts = [popcount(word) for word in words]
+                    own, before = words[0], fx.Int32(0)
+                    for w in range_constexpr(1, N_EXPERTS // 32):
+                        own = (ew == w).select(words[w], own)
+                        before = before + (ew >= w).select(counts[w - 1], fx.Int32(0))
+                    gi = before + popcount(own & ((fx.Int32(1) << eb) - 1))
+                    if lane < UG_ROUTED:
+                        lds_st(grp, gi, e)
+                    return sum(counts[1:], counts[0])
+
+                def flat_task(i, kind="mixed"):
+                    """Unit i of this CTA. ``kind``: "mixed" walks the flat list,
+                    "shared" is the CTA's shared unit (``u0 < UG_C``), "routed"
+                    unit i of the routed-only list and "group" unit i of the
+                    (expert group, column tile) list (``_UG_DEDUP``)."""
+                    if const_expr(kind == "group"):
+                        h = fx.Int32(h0 + i * G)
+                        live = h < grp_n * UG_C
+                        sh_ok, is_sh = False, fx.Boolean(False)
+                        smp = fx.min(h // UG_C, UG_ROUTED - 1)  # the group
+                        c, slot = h % UG_C, None
+                        e = _uniform(lds_ld(grp, smp))
+                        sn = n_sel()
+                    else:
+                        if const_expr(kind == "routed"):
+                            h = fx.Int32(h0 + i * G)
+                            live = None if (i + 1) * G <= N_RT else h < N_RT
+                            sh_ok, is_sh = False, fx.Boolean(False)
+                        else:
+                            g = fx.Int32(u0 + i * G)
+                            live = None if (i + 1) * G <= N_FLAT else g < N_FLAT
+                            # only a CTA's first unit can be a shared one: g >= G > UG_C after it
+                            sh_ok = i == 0 and UG_C <= G
+                            is_sh = (
+                                (g < UG_C) if const_expr(sh_ok) else fx.Boolean(False)
+                            )
+                            h = (g >= UG_C).select(g - UG_C, fx.Int32(0))
+                        smp = fx.min(h // UG_TASKS, S - 1)
+                        rr = h % UG_TASKS
+                        c = rr % UG_C
+                        slot = rr // UG_C + 1
+                        if const_expr(sh_ok):
+                            c = is_sh.select(g, c)
+                            slot = is_sh.select(fx.Int32(0), slot)
+                        if const_expr(kind == "shared"):  # ahead of `dn_route`'s table
+                            e = fx.Int32(SHARED_EXPERT)
+                        else:
+                            # keys slot 0 is the shared expert, as `dn_route` stores it
+                            e = _uniform(lds_ld(keys, smp * MOE_SLOTS + slot))
+                        sn = is_sh.select(n_sel(), smp) if const_expr(sh_ok) else smp
+                    w_rg = ((lane % 16) // 8) * (expert_inter // 16) + c // 2
+                    w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+                    s_rg = (lane // 32) * (expert_inter // 16) + c // 2
+                    ro = _ROUTED_ADDR and kind in ("routed", "group")
+                    if const_expr(live is None):
+                        rw = _rsrc(expert_addr(w_ug, e, UG_W_BYTES, 0, ro))
+                        rs = _rsrc(expert_addr(s_ug, e, UG_S_BYTES, 1, ro))
+                    else:
+                        rw = bo.create_buffer_resource_from_addr(
+                            expert_addr(w_ug, e, UG_W_BYTES, 0, ro),
+                            num_records_bytes=live.select(
+                                fx.Int32(UG_W_BYTES), fx.Int32(0)
+                            ),
+                        )
+                        rs = bo.create_buffer_resource_from_addr(
+                            expert_addr(s_ug, e, UG_S_BYTES, 1, ro),
+                            num_records_bytes=live.select(
+                                fx.Int32(UG_S_BYTES), fx.Int32(0)
+                            ),
+                        )
+                    # scales before weights, pinned: loads retire in order, so a
+                    # wait on a scale issued after the tile would drain the tile
+                    scs = [
+                        ld_f32(
+                            rs,
+                            (s_rg * 16 // SCALE_BM) * (HIDDEN // 128)
+                            + wave * UG8_UNITS
+                            + cc,
+                        )
+                        for cc in range(UG8_UNITS)
+                    ]
+                    rocdl.sched_barrier(0)
+                    units = []
+                    for cc in range_constexpr(UG8_UNITS):
+                        kc = (wave * UG8_UNITS + cc) * 2
+                        wv = [
+                            fx.Vector(
+                                bo.buffer_load(
+                                    rw,
+                                    ((w_rg * UG_NKC + kc + j) * 64 + w_ln) * 4,
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                )
+                            )
+                            for j in range(2)
+                        ]
+                        units.append(
+                            (
+                                "f8f8",
+                                wv,
+                                lambda sc=scs[cc], kc=kc, sn=sn: (
+                                    sc * lds_ld(misc, 8 + sn * XQ_S_STRIDE + kc // 2)
+                                ),
+                                sn * XW + kc * 16 + (lane // 16) * 4,
+                            )
+                        )
+                    return dict(
+                        units=units,
+                        live=live,
+                        sh_ok=sh_ok,
+                        is_sh=is_sh,
+                        smp=smp,
+                        slot=slot,
+                        c=c,
+                        e=e,
+                        kind=kind,
+                    )
+
+                def group_emit(t):
+                    """`flat_emit` of a group unit: column n is sample n, kept
+                    only if the sample routes to the group's expert, in the
+                    slot it routes it from."""
+                    c, e = t["c"], t["e"]
+
+                    def slot_of(n):
+                        """Sample n's `keys` slot of the group's expert, 0 if none
+                        (top-k names an expert at most once a sample)."""
+                        got = fx.Int32(0)
+                        for k in range_constexpr(1, TOP_K + 1):
+                            hit = lds_ld(keys, n * MOE_SLOTS + k) == e
+                            got = hit.select(fx.Int32(k), got)
+                        return got
+
+                    n = fx.min(tid // (UG8 // 2), S - 1)
+                    r = (tid % (UG8 // 2)) * 2
+                    rn = fx.min(tid, S - 1)
+                    gs, rs_ = slot_of(n), slot_of(rn)
+                    if (tid < S * UG8 // 2) & (gs != 0):
+                        g0, g1 = (
+                            lds_ld(outs, n * 16 + r),
+                            lds_ld(outs, n * 16 + r + 1),
+                        )
+                        v0 = lds_ld(outs, n * 16 + UG8 + r)
+                        v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
+                        put2(
+                            mb("mid"),
+                            (n * MOE_SLOTS + gs) * expert_inter + c * UG8 + r,
+                            g0 * _rcp(1.0 + _exp(-g0)) * v0,
+                            g1 * _rcp(1.0 + _exp(-g1)) * v1,
+                        )
+                    if (c == 0) & (tid < S) & (rs_ != 0):
+                        put(
+                            mb("sel"),
+                            rn * MOE_SLOTS + rs_,
+                            lds_ld(keys, rn * MOE_SLOTS + rs_),
+                        )
+                        put(
+                            mb("prob"),
+                            rn * MOE_SLOTS + rs_,
+                            lds_ld(dnw, rn * MOE_SLOTS + rs_),
+                        )
+
+                def flat_emit(t):
+                    if const_expr(t["kind"] == "group"):
+                        return group_emit(t)
+                    sh_ok, is_sh = t["sh_ok"], t["is_sh"]
+                    smp, slot, c = t["smp"], t["slot"], t["c"]
+                    if const_expr(sh_ok):
+                        n_act = is_sh.select(fx.Int32(S * UG8 // 2), fx.Int32(UG8 // 2))
+                        n_rec = is_sh.select(fx.Int32(S), fx.Int32(1))
+                    else:
+                        n_act, n_rec = fx.Int32(UG8 // 2), fx.Int32(1)
+                    if tid < n_act:
+                        n = tid // (UG8 // 2)
+                        r = (tid % (UG8 // 2)) * 2
+                        g0, g1 = (
+                            lds_ld(outs, n * 16 + r),
+                            lds_ld(outs, n * 16 + r + 1),
+                        )
+                        v0 = lds_ld(outs, n * 16 + UG8 + r)
+                        v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
+                        sn = is_sh.select(n, smp) if const_expr(sh_ok) else smp
+                        put2(
+                            mb("mid"),
+                            (sn * MOE_SLOTS + slot) * expert_inter + c * UG8 + r,
+                            g0 * _rcp(1.0 + _exp(-g0)) * v0,
+                            g1 * _rcp(1.0 + _exp(-g1)) * v1,
+                        )
+                    if (c == 0) & (tid < n_rec):
+                        sn = is_sh.select(tid, smp) if const_expr(sh_ok) else smp
+                        if const_expr(
+                            t["kind"] == "shared"
+                        ):  # what `dn_route` will store
+                            rec_sel = fx.Int32(SHARED_EXPERT)
+                            rec_prob = fx.Float32(1.0)
+                        else:
+                            rec_sel = lds_ld(keys, sn * MOE_SLOTS + slot)
+                            rec_prob = lds_ld(dnw, sn * MOE_SLOTS + slot)
+                        put(mb("sel"), sn * MOE_SLOTS + slot, rec_sel)
+                        put(mb("prob"), sn * MOE_SLOTS + slot, rec_prob)
+
+                def flat_body(t, i):
+                    if const_expr(i == 0):
+                        stamp("ug", u0, 0)
+                    stamp("ug", u0, 1)
+                    acc = mma_units([fx.Float32(0.0) for _ in range(4)], t["units"])
+                    stamp("ug", u0, 2)
+                    reduce_rows(1, acc, emit_out(16))
+                    gpu.barrier()
+                    stamp("ug", u0, 3)
+                    flat_emit(t)
+                    stamp("ug", u0, 4)
+
+                if const_expr(_UG_SH_EARLY):
+                    ug_bs = load_bias()
+                    if u0 < UG_C:  # CTA-uniform: the unit's barriers stay matched
+                        t_sh = flat_task(0, "shared")
+                        stage_xq(list(range(S)))
+                        gpu.barrier()
+                        flat_body(t_sh, -1)
+                    dn_route(ug_bs)
+                    gpu.barrier()
+                    kind, n_rounds = "routed", R_RT
+                    if const_expr(_UG_DEDUP):
+                        grp_n = ug_groups_wave()
+                        kind = "group"
+                    flat_q = [flat_task(0, kind)]
+                    if u0 >= UG_C:  # the shared CTAs staged it above
+                        stage_xq(list(range(S)))
+                else:
+                    kind, n_rounds = "mixed", R_FLAT
+                    flat_q = [flat_task(0, kind)]
+                    stage_xq(list(range(S)))
+                gpu.barrier()
+
+                def group_round(i, t):
+                    """Round i and, nested in its liveness, the rounds after it.
+
+                    How many units a CTA has depends on the step's group count,
+                    so most CTAs end rounds early. A dead round issues its
+                    prefetch all the same (out of range, zeros), and `down`'s
+                    first barrier waits on those loads: 2.8 us at S=8 with
+                    rounds in a flat loop. Nesting stops a CTA one prefetch
+                    after its last unit."""
+                    if const_expr(i + 1 < n_rounds):
+                        t_next = flat_task(i + 1, kind)
+                    flat_body(t, i)
+                    if const_expr(i + 1 < n_rounds):
+                        if t_next["live"]:  # CTA-uniform
+                            group_round(i + 1, t_next)
+
+                if const_expr(kind == "group"):
+                    t_first = flat_q.pop(0)
+                    if t_first["live"]:  # CTA-uniform
+                        group_round(0, t_first)
+                for i in range_constexpr(0 if kind == "group" else n_rounds):
+                    if const_expr(i + 1 < n_rounds):
+                        flat_q.append(flat_task(i + 1, kind))
+                    t = flat_q.pop(0)
+                    live = t["live"]
+                    if const_expr(live is None):
+                        flat_body(t, i)
+                    else:
+                        if live:  # CTA-uniform: the unit's barriers stay matched
+                            flat_body(t, i)
+
+            if const_expr(_UG_FLAT):
+                ug_flat()
+            else:
+                for task_round in range_constexpr(UG_ROUNDS):
+                    if const_expr(moe_dedup or (task_round + 1) * G <= UG_TASKS):
+                        ug_round(task_round)
+                    else:
+                        # CTA-uniform: the round's barriers stay matched
+                        if fx.Int32(u0 + task_round * G) < UG_TASKS:
+                            ug_round(task_round)
 
         # ======== 10. mid FP8 quant + expert down + route weighting + MoE TP reduce
         # 2 row groups x (sample tile * 9 slots * 4) chunks: 4 waves per group.
@@ -5194,7 +6545,7 @@ def build_ml4_monokernel(
             t = fx.Int32(t)
             stamp("down", t, 0)
             if const_expr(
-                ug_split(S, expert_inter) is None
+                ug_split(S, expert_inter) is None and not _DN_ROUTE_REUSE
             ):  # retain the tuned down-stage route schedule
                 dn_route(load_bias())
             gpu.barrier()
@@ -5250,7 +6601,7 @@ def build_ml4_monokernel(
                 slot_q = (q // DN_NKC) % DN_SLOTS + DN_SLOT0
                 e = _uniform(lds_ld(keys, s_q * MOE_SLOTS + slot_q))
                 wb = bo.create_buffer_resource_from_addr(
-                    expert_addr(w_dn, e, DN_W_BYTES, 2),
+                    expert_addr(w_dn, e, DN_W_BYTES, 2, _ROUTED_ADDR and DN_SHARED),
                     num_records_bytes=(
                         None
                         if DN_NU % DN_WPR == 0
@@ -5258,7 +6609,7 @@ def build_ml4_monokernel(
                     ),
                 )
                 sb = bo.create_buffer_resource_from_addr(
-                    expert_addr(s_dn, e, DN_S_BYTES, 3),
+                    expert_addr(s_dn, e, DN_S_BYTES, 3, _ROUTED_ADDR and DN_SHARED),
                     num_records_bytes=(
                         None
                         if DN_NU % DN_WPR == 0
@@ -5389,8 +6740,8 @@ def build_ml4_monokernel(
                 # a build-time address: no `keys` read, no readfirstlane, and
                 # one resource build per tile instead of one per DN_HOIST run
                 if const_expr(separate_shared):
-                    dn_sh_wb = _rsrc(index_arg(SHARED_EXPERT_ARGS + 2))
-                    dn_sh_sb = _rsrc(index_arg(SHARED_EXPERT_ARGS + 3))
+                    dn_sh_wb = _rsrc(shared_ptr(2))
+                    dn_sh_sb = _rsrc(shared_ptr(3))
                 else:
                     dn_sh_wb = _rsrc(
                         w_dn + fx.Int64(SHARED_EXPERT) * fx.Int64(DN_W_BYTES)
@@ -5398,6 +6749,32 @@ def build_ml4_monokernel(
                     dn_sh_sb = _rsrc(
                         s_dn + fx.Int64(SHARED_EXPERT) * fx.Int64(DN_S_BYTES)
                     )
+            if const_expr(_DN_MID8):
+                # this tile's share of the quantization: one block a wave
+                for j in range_constexpr((DN_BLK + N_DN_TILES - 1) // N_DN_TILES):
+                    q_blk = t + j * N_DN_TILES
+                    if (wave == j) & (q_blk < DN_BLK):  # wave-uniform
+                        m8_v = get2(mb("mid"), q_blk * 128 + lane * 2)
+                        m8_q0, m8_q1, m8_qs = quant_scaled(m8_v[0], m8_v[1])
+                        m8_w = (
+                            fx.Int32(
+                                rocdl.cvt_pk_fp8_f32(
+                                    T.i32, m8_q0, m8_q1, fx.Int32(0), False
+                                )
+                            )
+                            & 0xFFFF
+                        )
+                        m8_wn = _xshfl(m8_w, 1)
+                        if lane % 2 == 0:  # bytes 2 lane .. 2 lane + 3
+                            put(
+                                mb("mid8"), q_blk * 32 + lane // 2, m8_w | (m8_wn << 16)
+                            )
+                        if lane == 0:
+                            put(
+                                mb("mid8s"),
+                                q_blk,
+                                m8_qs * lds_ld(dnw, q_blk // (expert_inter // 128)),
+                            )
             if const_expr(S <= 4):
                 pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
             hint_wait(
@@ -5415,14 +6792,67 @@ def build_ml4_monokernel(
                 ),
                 mark=("down", t),
             )
-            mids = get2_many(
-                [
-                    (mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2)
+            if const_expr(_DN_MID8):
+                # Threads past the end re-read the last word / scale and store
+                # it again to the same LDS word, so they need no branch.
+                N_W8 = DN_BLK * 32
+                w8_ix = [
+                    fx.min(tid + i * THREADS, N_W8 - 1)
+                    for i in range((N_W8 + THREADS - 1) // THREADS)
+                ]
+                s8_ix = [
+                    fx.min(tid + i * THREADS, DN_BLK - 1)
+                    for i in range((DN_BLK + THREADS - 1) // THREADS)
+                ]
+                got8 = poll(
+                    [(mb("mid8"), i, 1) for i in w8_ix]
+                    + [(mb("mid8s"), i, 1) for i in s8_ix]
+                )
+                stamp("down", t, 2)
+                for i in range_constexpr(len(w8_ix)):
+                    lds_st(
+                        xs,
+                        w8_ix[i]
+                        if const_expr(aiter_fp8_experts)
+                        else f8_word(w8_ix[i] * 4),
+                        got8[i][0].bitcast(fx.Float32),
+                    )
+                for i in range_constexpr(len(s8_ix)):
+                    lds_st(misc, s8_ix[i], got8[len(w8_ix) + i][0].bitcast(fx.Float32))
+            elif const_expr(GFX942):
+                mid_blks = [
+                    fx.min(wave + b * WAVES, DN_BLK - 1)
                     for b in range((DN_BLK + WAVES - 1) // WAVES)
                 ]
-            )
-            stamp("down", t, 2)
-            for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
+                mids = get2_many([(mb("mid"), k * 128 + lane * 2) for k in mid_blks])
+                stamp("down", t, 2)
+            else:
+                mids = get2_many(
+                    [
+                        (
+                            mb("mid"),
+                            fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2,
+                        )
+                        for b in range((DN_BLK + WAVES - 1) // WAVES)
+                    ]
+                )
+                stamp("down", t, 2)
+            if const_expr(_DN_QUANT_BATCH and not expert_mxfp4 and not _DN_MID8):
+                # A wave's blocks past DN_BLK are clamped onto DN_BLK - 1: they
+                # rewrite the same bytes as its owner, so they need no branch.
+                qz = quant_scaled_many(mids)
+                st_f8_many(
+                    [(k * 128 + lane * 2, q[0], q[1]) for k, q in zip(mid_blks, qz)]
+                )
+                dws = [lds_ld(dnw, k // (expert_inter // 128)) for k in mid_blks]
+                if lane == 0:
+                    for b in range_constexpr(len(mid_blks)):
+                        lds_st(misc, mid_blks[b], qz[b][2] * dws[b])
+            for b in range_constexpr(
+                0
+                if _DN_QUANT_BATCH and not expert_mxfp4
+                else (DN_BLK + WAVES - 1) // WAVES
+            ):
                 blk = wave + b * WAVES
                 if blk < DN_BLK:
                     if const_expr(expert_mxfp4):
@@ -5450,7 +6880,9 @@ def build_ml4_monokernel(
                                 blk,
                                 qs * lds_ld(dnw, blk // (expert_inter // 128)),
                             )
+            stamp("down", t, 7)  # this wave's mid staged, before the barrier
             gpu.barrier()
+            stamp("down", t, 5)  # mid quantized into LDS
             if const_expr(S > 4):
                 pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
             # The shared expert leads every column's run, as it did when it was
@@ -5475,6 +6907,7 @@ def build_ml4_monokernel(
                         ],
                     )
             acc = run_units(u_dn, DN_UPW, DN_BATCH, pre, acc0=acc0)
+            stamp("down", t, 6)  # MFMA chain done
 
             def emit_dn(rl, n, v):
                 if (rl >= dn_off) & (rl < dn_off + DN_TILE):

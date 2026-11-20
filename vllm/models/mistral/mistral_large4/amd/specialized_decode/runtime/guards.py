@@ -20,17 +20,21 @@ def model_refusals(model, config: DecodeConfig) -> list[str]:
         MonoUnsupported,
     )
 
-    from .weights import check_moe_layer, moe_kinds
+    from .weights import check_dense_layer, check_moe_layer, moe_kinds
 
     reasons: list[str] = []
     layers = list(model.layers)
+    first = config.first_layer
     try:
-        moe_kinds(layers)
+        moe_kinds(layers, first)
     except MonoUnsupported as err:
         reasons.append(str(err))
-    for layer in layers[1:]:
+    for layer in layers[first:]:
         try:
-            check_moe_layer(layer)
+            if layer.self_attn.spec.is_moe:
+                check_moe_layer(layer, config.tp_size)
+            else:
+                check_dense_layer(layer, config.tp_size)
         except (MonoUnsupported, AttributeError) as err:
             reasons.append(f"layer {layer.self_attn.spec.layer_idx}: {err}")
     # aux hidden-state taps (DSpark) are cloned off the residual stream between
@@ -46,27 +50,37 @@ def model_refusals(model, config: DecodeConfig) -> list[str]:
     except ImportError as err:
         reasons.append(f"requires FlyDSL and AITER FlyDSL helpers ({err})")
         return reasons
-    if get_cdna_version() != 4:
-        reasons.append("requires CDNA4 / gfx950")
+    cdna = get_cdna_version()
+    if cdna not in (3, 4):
+        reasons.append("requires CDNA3 / gfx942 or CDNA4 / gfx950")
     index = torch.accelerator.current_device_index()
     cus = current_platform.get_device_properties(index).multi_processor_count
-    if cus != config.blocks:
+    # one co-resident CTA a CU: gfx950's 256 CUs exactly, 256 of gfx942's 304
+    fits = cus == config.blocks if cdna == 4 else cus >= config.blocks
+    if not fits:
         reasons.append(f"requires {config.blocks} compute units, found {cus}")
     return reasons
 
 
-def cache_refusals(model, max_model_len: int) -> list[str]:
+def cache_refusals(model, max_model_len: int, first: int = 1) -> list[str]:
     """At bind: every kernel layer's latent and indexer caches."""
     reasons: list[str] = []
     page = None
-    for layer in list(model.layers)[1:]:
+    for layer in list(model.layers)[first:]:
         attn = layer.self_attn
         i = attn.spec.layer_idx
         kv = attn.attn.kv_cache
-        # bf16, or fp8 (E4M3) which vLLM stores as uint8 and views as fp8 per call
+        # bf16, or fp8 (E4M3; FNUZ on gfx942) which vLLM stores as uint8 and
+        # views as fp8 per call
         if (
             kv.dim() != 3
-            or kv.dtype not in (torch.bfloat16, torch.uint8, torch.float8_e4m3fn)
+            or kv.dtype
+            not in (
+                torch.bfloat16,
+                torch.uint8,
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            )
             or kv.shape[-1] != LATENT
         ):
             reasons.append(f"layer {i}: KV cache {kv.dtype} {tuple(kv.shape)}")

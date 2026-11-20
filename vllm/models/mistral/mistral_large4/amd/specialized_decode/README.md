@@ -1,7 +1,7 @@
-# Mistral Large 4 specialized decode (MI350X / MI355X)
+# Mistral Large 4 specialized decode (MI350X / MI355X, MI300X / MI325X)
 
-An opt-in decode path for Mistral Large 4 at TP4 on gfx950, following
-RFC #60904. A pure decode step of 1, 2 or 4 requests (one token each) runs
+An opt-in decode path for Mistral Large 4 at TP4 on gfx950 (and at TP8 on
+gfx942, see [below](#mi300x--mi325x-gfx942-tp8)), following RFC #60904. A pure decode step of 1, 2 or 4 requests (one token each) runs
 every MoE decoder layer (1-71) as one persistent FlyDSL MonoKernel launch (256
 CTAs, all resident), in "step mode": the specialized decode runs the whole
 forward. Each launch covers the input
@@ -48,13 +48,14 @@ one `ValueError` listing every reason (default-deny):
 - **Config, in the model's `__init__`** (`runtime/spec.py`): pipeline, data,
   expert, decode- or prefill-context parallelism, EPLB, DBO / ubatching, LoRA,
   KV connectors or offloading, routed-expert capture, speculative decoding
-  other than DSpark (or dynamic, or more than 11 speculative tokens), sleep mode, weight transfer, CPU weight offload, stock torch.compile, the V1
+  other than DSpark (or dynamic, or more than 11 speculative tokens, or any on
+  gfx942), sleep mode, weight transfer, CPU weight offload, stock torch.compile, the V1
   model runner, a KV cache dtype other than FP8 (E4M3) or bf16, a block size
   that is not a multiple of 16, block-FP8 experts not re-quantized to a4w4.
 - **Loaded model, when the model state builds the decode** (`runtime/guards.py`):
   the layer mix (one dense layer, then MoE layers whose kinds the kernels
   build), each kernel layer's weight dtypes and shapes, the MoE backend,
-  ROCm / FlyDSL / gfx950 / 256 CUs.
+  ROCm / FlyDSL / gfx950 with 256 CUs (or gfx942 with at least 256).
 - **KV scales, after load** (`runtime/runner.py`): an FP8 latent cache whose
   KV scale is not 1.0 (the kernels read and write it unscaled).
 - **Caches, at the first planned step**: each layer's latent and indexer cache
@@ -62,10 +63,71 @@ one `ValueError` listing every reason (default-deny):
 
 Every TP rank agrees on each verdict before anything collective runs.
 
+## MI300X / MI325X (gfx942, TP8)
+
+```bash
+vllm serve <Mistral-Large-4> -tp 8 --dtype bfloat16 \
+  --additional-config '{"decode_backend": "latency_specialized"}'
+```
+
+On gfx942 the decode runs at TP8 (8 local heads a rank), where the block-FP8
+checkpoint fits at about 125 GB a GPU. Leave `VLLM_FP8_MOE_REQUANT` unset: the
+kernels read the block-FP8 (FNUZ) routed experts in place, and a re-quantized
+deployment is refused. The kernels run 256 CTAs on 256 of the 304 CUs. A pure
+decode step of 1, 2, 4 or 8 rows is served (the 8-row launch is 8% to 21%
+faster than two 4-row launches, the more so the more experts its rows share),
+and the dense layer 0 runs as one more launch, its MLP as four routed experts
+at weight 1. An FP8 latent cache is E4M3FNUZ, as vLLM stores it on gfx942.
+Speculative decoding is refused on gfx942 for now: the TP8 verify launch (q > 1
+rows a request) is not validated.
+
+gfx942 has 64 KB of LDS and no FP4 MFMA, so a split task holds 32 keys, the
+experts run FP8 MFMAs, and the schedule is retuned for the TP8 shapes. Each
+change below is bit-identical and measured faster where it is on; the kernel
+comments carry the numbers.
+
+- `qkv_a`: one task per four-sample staging tile at S > 4, separate tasks for
+  the index key / head-weight tiles, and one cache-insert task per row.
+- `q_b` / `index_q`: a tile's input poll goes out under the previous tile's
+  MFMAs.
+- Indexer: a row with at most top-k keys reads them by position and skips the
+  index query, scores and selection.
+- Sparse attention: splits past a row's last key are skipped and odd rounds
+  walk the splits in reverse; each CTA loads its split rounds' row bounds, key
+  pages and cache slots at kernel start, one word a lane; a wave issues all its
+  KV row loads before waiting on any (S > 2) and polls its keys written by this
+  launch in one round trip (S > 1); QK reads the next K step's LDS operands
+  under the current MFMAs.
+- Split merge / W_UV: each of a head's four W_UV tasks merges one latent
+  quarter and gathers the others.
+- MoE: up/gate runs as one flat task list at S > 1, its shared-expert units
+  while the router is busy; at S = 1 a CTA stages and routes once for all its
+  tasks; `down` reuses `ug`'s routing table and, at S > 1, quantizes each
+  128-block of the mid once for every CTA. At S = 8, up/gate runs one unit per
+  distinct routed expert and column tile, with every row that routes to it in
+  the MFMA's columns, and the routed-only weight streams skip the shared
+  expert's address select, whose param-table load drains the loads in flight
+  (slower at S = 2 and 4). At S = 2 the shared expert's pointers are read once,
+  ahead of the MoE.
+- Arithmetic: forms that keep the waitcnt pass and LLVM from serializing (an
+  unpacked coefficient multiply, max / min without NaN propagation, the FP8
+  block amax as one DPP chain); same bits for finite values.
+
+Every one of these is gated on gfx942: the gfx950 kernels compile to the same
+LLVM IR as before.
+
+The runner builds the gfx942 kernels with `own_key_counts`: each row's key
+count comes from its position and slot instead of `sparse_kv_indptr`, which the
+runner then does not compute. `MONO_OWN_KEYS=1` does the same for callers that
+leave it unset, such as `Ml4MonoKernel`. For timelines (`--timeline` in the
+kernel harness), `MONO_TL_ONLY` and `MONO_TL_COLS` limit the stamps to some
+stages and columns: the stamps cost registers, and a full timeline build spills.
+
 ## Steps
 
 `plan()` runs once per forward. It picks the kernels for a pure decode step
-whose row count is one of the built widths, 1, 2 or 4 (`DecodeConfig.widths`:
+whose row count is one of the built widths, 1, 2 or 4 (1, 2, 4 or 8 on
+gfx942; `DecodeConfig.widths`:
 vLLM's FULL-graph capture sizes, so graph replays pad decode batches to them;
 padded rows attend to no keys and write nothing). Every other step runs vLLM's
 layers: prefill, mixed, wider (5+ requests), eager steps of other sizes and

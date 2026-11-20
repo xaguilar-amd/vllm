@@ -10,8 +10,10 @@ import torch
 
 from vllm.config import CompilationMode
 from vllm.models.mistral.common.layer_spec import get_layer_specs
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.runtime import spec
 from vllm.models.mistral.mistral_large4.amd.specialized_decode.runtime.spec import (
     DECODE_CONFIG,
+    on_gfx942,
     specialized_decode_config,
 )
 
@@ -43,7 +45,8 @@ def vllm_config(**overrides):
     """A supported deployment; `overrides` (dotted names) change one field."""
     cfg = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            tensor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1,
+            tensor_parallel_size=DECODE_CONFIG.tp_size, pipeline_parallel_size=1,
+            data_parallel_size=1,
             decode_context_parallel_size=1, prefill_context_parallel_size=1,
             use_ubatching=False, enable_expert_parallel=False, enable_eplb=False,
         ),
@@ -71,10 +74,20 @@ def vllm_config(**overrides):
     return cfg
 
 
+def set_requant(monkeypatch, requant: bool, act: str = "a4w4"):
+    if requant:
+        monkeypatch.setenv("VLLM_FP8_MOE_REQUANT", "mxfp4")
+        monkeypatch.setenv("VLLM_FP8_MOE_REQUANT_ACT", act)
+    else:
+        monkeypatch.delenv("VLLM_FP8_MOE_REQUANT", raising=False)
+        monkeypatch.delenv("VLLM_FP8_MOE_REQUANT_ACT", raising=False)
+
+
 @pytest.fixture(autouse=True)
-def a4w4(monkeypatch):
-    monkeypatch.setenv("VLLM_FP8_MOE_REQUANT", "mxfp4")
-    monkeypatch.setenv("VLLM_FP8_MOE_REQUANT_ACT", "a4w4")
+def expert_format(monkeypatch):
+    """The routed experts the platform's kernels read: block FP8 in place on
+    gfx942, vLLM's MXFP4 a4w4 re-quantization on gfx950."""
+    set_requant(monkeypatch, requant=not on_gfx942())
 
 
 def test_off_by_default():
@@ -93,9 +106,11 @@ def test_switches():
 
 
 def test_refusal_lists_every_reason(monkeypatch):
-    monkeypatch.setenv("VLLM_FP8_MOE_REQUANT_ACT", "a8w4")
+    # gfx942 refuses any re-quantization, gfx950 an a8w4 one
+    set_requant(monkeypatch, requant=True, act="a8w4")
+    tp = DECODE_CONFIG.tp_size
     cfg = vllm_config(**{
-        "parallel_config.tensor_parallel_size": 8,
+        "parallel_config.tensor_parallel_size": tp // 2,
         "cache_config.cache_dtype": "fp8_ds_mla",
         "speculative_config": object(),
     })  # fmt: skip
@@ -103,10 +118,39 @@ def test_refusal_lists_every_reason(monkeypatch):
         specialized_decode_config(cfg)
     msg = str(err.value)
     for part in (
-        "tensor parallel size 4", "bf16 or fp8 (e4m3) KV cache", "speculative decoding",
-        "a4w4",
+        f"tensor parallel size {tp}", "bf16 or fp8 (e4m3) KV cache",
+        "speculative decoding", "VLLM_FP8_MOE_REQUANT",
     ):  # fmt: skip
         assert part in msg, msg
+
+
+@pytest.mark.parametrize("gfx942", (False, True))
+@pytest.mark.parametrize("requant", (False, True))
+def test_routed_expert_format(monkeypatch, gfx942, requant):
+    """gfx942 reads the block-FP8 experts in place and refuses re-quantized
+    ones; gfx950 requires vLLM's MXFP4 a4w4 re-quantization."""
+    monkeypatch.setattr(spec, "on_gfx942", lambda: gfx942)
+    set_requant(monkeypatch, requant)
+    reasons = DECODE_CONFIG.refusal_reasons(vllm_config())
+    refused = any("VLLM_FP8_MOE_REQUANT" in r for r in reasons)
+    assert refused == (gfx942 == requant), reasons
+
+
+@pytest.mark.parametrize("gfx942", (False, True))
+def test_speculative_decoding(monkeypatch, gfx942):
+    """DSpark verify blocks run the kernels on gfx950; gfx942 refuses any
+    speculative decoding."""
+    monkeypatch.setattr(spec, "on_gfx942", lambda: gfx942)
+    set_requant(monkeypatch, requant=not gfx942)
+    dspark = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=3,
+        uses_dynamic_speculative_decoding=lambda: False,
+    )
+    reasons = DECODE_CONFIG.refusal_reasons(vllm_config(speculative_config=dspark))
+    assert reasons == (
+        ["does not support speculative decoding on gfx942"] if gfx942 else []
+    )
 
 
 @pytest.mark.parametrize(
@@ -130,7 +174,7 @@ def test_default_deny(field, value):
 def test_widths_are_graph_capture_sizes():
     # vLLM pads decode batches to its capture sizes 1, 2, 4, 8, ...; every width
     # the kernels serve must be one, or FULL-graph replays would never use them
-    assert DECODE_CONFIG.widths == (1, 2, 4)
+    assert DECODE_CONFIG.widths == ((1, 2, 4, 8) if on_gfx942() else (1, 2, 4))
 
 
 def test_supported_has_no_reasons():

@@ -3,11 +3,15 @@
 """One MoE decoder layer's kernel arguments, built from the loaded vLLM modules.
 
 Attention / indexer / router weights are repacked into the kernels' tiled
-formats (copies). The routed experts are read in place: vLLM's AITER a4w4 MXFP4
-storage (aiter `shuffle_weight` values, `e8m0_shuffle` scales) is the
-kernels' ATOM layout. The shared expert, a separate block-FP8 MLP in vLLM, is
-re-quantized to MXFP4 the way `VLLM_FP8_MOE_REQUANT` quantizes the routed
-experts and passed through its own pointers.
+formats (copies). The routed experts are read in place. On gfx950 that is
+vLLM's AITER a4w4 MXFP4 storage (aiter `shuffle_weight` values, `e8m0_shuffle`
+scales), the kernels' ATOM layout. The shared expert, a separate block-FP8 MLP
+in vLLM, is re-quantized to MXFP4 the way `VLLM_FP8_MOE_REQUANT` quantizes the
+routed experts and passed through its own pointers. On gfx942 the routed
+experts stay block-FP8 (FNUZ) in AITER's MoE storage (`shuffle_weight` values,
+[N / 128, K / 128] fp32 scales), and the shared expert is copied into that
+layout. The dense layer 0 (gfx942) is one more such layer: its MLP copied into
+that layout as four routed experts the router always picks.
 """
 
 from dataclasses import dataclass
@@ -34,12 +38,20 @@ from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.weigh
     pack_bf16,
     pack_fp8,
 )
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.runtime.spec import (
+    on_gfx942,
+)
 from vllm.models.mistral.mistral_large4.amd.specialized_decode.runtime.variants import (
     KernelVariant,
 )
 
-FP8 = torch.float8_e4m3fn
+GFX942 = on_gfx942()
+# vLLM's FP8 weights after load: FNUZ on gfx942 (largest finite 240)
+FP8 = torch.float8_e4m3fnuz if GFX942 else torch.float8_e4m3fn
+FP8_MAX = torch.finfo(FP8).max
 N_ROUTED = 128
+TOP_K = 4  # routed experts a token
+EXPERT_INTER = 6144  # an expert's intermediate dimension over all TP ranks
 INDEX_HEADS = 32
 INDEX_DIM = 128
 FP8_BLOCK = [128, 128]
@@ -76,18 +88,19 @@ KINDS = {
 }
 
 
-def moe_kinds(layers) -> list[str]:
-    """Kernel variant per MoE layer (1..); raises when the layer mix is unsupported."""
+def moe_kinds(layers, first: int = 1) -> list[str]:
+    """Kernel variant per launched layer (`first`..: 1, or 0 with the dense layer
+    0 launched too); raises when the layer mix is unsupported."""
     if layers[0].self_attn.spec.is_moe or not all(
         lyr.self_attn.spec.is_moe for lyr in layers[1:]
     ):
         raise MonoUnsupported("layer mix: expected one dense layer, then MoE layers")
-    kinds = [layer_kind(lyr.self_attn.spec) for lyr in layers[1:]]
+    kinds = [layer_kind(lyr.self_attn.spec) for lyr in layers[first:]]
     last_indexer = None
-    for i, kind in enumerate(kinds):
+    for i, kind in enumerate(kinds, first):
         if kind == LayerKind.ROPE_SHARED and last_indexer != LayerKind.ROPE:
             # the top-k is read from the RoPE package's scratch
-            raise MonoUnsupported(f"layer {i + 1}: shared top-k after {last_indexer}")
+            raise MonoUnsupported(f"layer {i}: shared top-k after {last_indexer}")
         if KINDS[kind][2]:
             last_indexer = kind
     return kinds
@@ -95,7 +108,24 @@ def moe_kinds(layers) -> list[str]:
 
 def check_moe_layer(layer, npes: int = 4) -> None:
     """The weight checks of `build_moe_layer` without building anything."""
-    attn = layer.self_attn
+    _check_attention(layer.self_attn, npes)
+    if layer.mlp.shared_experts is None:
+        raise MonoUnsupported("MoE layer without a shared expert")
+    _fp8_param(layer.mlp.shared_experts.gate_up_proj)
+    _fp8_param(layer.mlp.shared_experts.down_proj)
+    if GFX942:
+        _routed_experts_fp8(layer.mlp.experts)
+    else:
+        _routed_experts(layer.mlp.experts)
+
+
+def check_dense_layer(layer, npes: int) -> None:
+    """The weight checks of `build_moe_layer` on the dense layer, unbuilt."""
+    _check_attention(layer.self_attn, npes)
+    _dense_slices(layer.mlp, EXPERT_INTER // npes)
+
+
+def _check_attention(attn, npes: int) -> None:
     if attn.num_local_heads * npes != 64 or attn.v_head_dim != 128:
         raise MonoUnsupported("attention geometry")
     _fp8_param(attn.q_proj)
@@ -110,21 +140,17 @@ def check_moe_layer(layer, npes: int = 4) -> None:
         if ix.ssmax is None or ix.n_head != INDEX_HEADS or ix.head_dim != INDEX_DIM:
             raise MonoUnsupported("indexer geometry")
         _fp8_param(ix.wq_b)
-    if layer.mlp.shared_experts is None:
-        raise MonoUnsupported("MoE layer without a shared expert")
-    _fp8_param(layer.mlp.shared_experts.gate_up_proj)
-    _fp8_param(layer.mlp.shared_experts.down_proj)
-    _routed_experts(layer.mlp.experts)
 
 
 def _q128(w: torch.Tensor, block_cols: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
-    """bf16/fp32 [r, c] -> (fp8, fp32 scale per 128 x block_cols block), amax / 448."""
+    """bf16/fp32 [r, c] -> (fp8, fp32 scale per 128 x block_cols block),
+    amax / FP8_MAX."""
     r, c = w.shape
     w = w.float()
     wp = F.pad(w, (0, (-c) % block_cols, 0, (-r) % 128))
     b = wp.view(wp.shape[0] // 128, 128, wp.shape[1] // block_cols, block_cols)
-    s = b.abs().amax((1, 3)).clamp_min(1e-12) / 448.0
-    q = (b / s[:, None, :, None]).clamp(-448, 448).view_as(wp)[:r, :c].to(FP8)
+    s = b.abs().amax((1, 3)).clamp_min(1e-12) / FP8_MAX
+    q = (b / s[:, None, :, None]).clamp(-FP8_MAX, FP8_MAX).view_as(wp)[:r, :c].to(FP8)
     return q.contiguous(), s.contiguous()
 
 
@@ -200,6 +226,121 @@ def _routed_experts(experts) -> dict[str, torch.Tensor]:
     return out
 
 
+def _shared_expert_fp8(mlp) -> dict[str, torch.Tensor]:
+    """The shared expert's block-FP8 weights in the routed experts' AITER
+    storage (`_routed_experts_fp8`): a copy of the values through aiter's
+    `shuffle_weight`, the scales as they are."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    ug, s_ug = _fp8_param(mlp.gate_up_proj)  # rows [gate; up], as w13
+    dn, s_dn = _fp8_param(mlp.down_proj)
+    w13, w2 = rocm_aiter_ops.shuffle_weights(ug[None], dn[None])
+    return {
+        "w_ug_sh": w13.contiguous(),
+        "w_dn_sh": w2.contiguous(),
+        "s_ug_sh": s_ug,
+        "s_dn_sh": s_dn,
+    }
+
+
+def _routed_experts_fp8(experts) -> dict[str, torch.Tensor]:
+    """Views of vLLM's block-FP8 routed-expert storage on AITER (no copy):
+    `shuffle_weight` 16x16 values and fp32 [N / 128, K / 128] scales an
+    expert."""
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+
+    experts = getattr(experts, "routed_experts", experts)  # shared-expert wrapper
+    method = getattr(experts, "quant_method", None)
+    method = getattr(method, "old_quant_method", method)  # modular-kernel wrapper
+    backend = getattr(method, "fp8_backend", None)
+    if backend != Fp8MoeBackend.AITER:
+        raise MonoUnsupported(
+            f"routed experts on {backend} ({type(experts).__name__}/"
+            f"{type(method).__name__}); mono reads AITER block-FP8 storage"
+        )
+    out = {}
+    for name, key in (
+        ("w13_weight", "w_ug"),
+        ("w13_weight_scale_inv", "s_ug"),
+        ("w2_weight", "w_dn"),
+        ("w2_weight_scale_inv", "s_dn"),
+    ):
+        t = getattr(experts, name).data
+        if t.shape[0] != N_ROUTED or not t.is_contiguous():
+            raise MonoUnsupported(f"{name} {tuple(t.shape)}")
+        if key.startswith("w"):
+            if t.dtype != FP8:
+                raise MonoUnsupported(f"{name}: expected {FP8}, got {t.dtype}")
+            t.is_shuffled = True  # aiter shuffle_weight layout (backend checked above)
+        else:
+            n, k = getattr(experts, name[: -len("_scale_inv")]).shape[-2:]
+            if t.dtype != torch.float32 or tuple(t.shape[1:]) != (n // 128, k // 128):
+                raise MonoUnsupported(f"{name} {t.dtype} {tuple(t.shape)}")
+        out[key] = t
+    return out
+
+
+def _dense_slices(mlp, inter: int) -> tuple[torch.Tensor, ...]:
+    """The dense MLP's block-FP8 [gate; up] and down weights and scales; its
+    intermediate dimension is TOP_K expert slices of `inter`."""
+    if not GFX942:
+        raise MonoUnsupported("dense layer in the kernels: gfx942 only")
+    ug, s_ug = _fp8_param(mlp.gate_up_proj)  # rows [gate; up]
+    dn, s_dn = _fp8_param(mlp.down_proj)
+    if ug.shape[0] != 2 * TOP_K * inter or dn.shape[1] != TOP_K * inter:
+        raise MonoUnsupported(
+            f"dense MLP {tuple(ug.shape)} / {tuple(dn.shape)}: not {TOP_K} "
+            f"slices of {inter}"
+        )
+    return ug, s_ug, dn, s_dn
+
+
+def _dense_mlp_fp8(mlp, inter: int) -> dict[str, torch.Tensor]:
+    """The dense MLP as TOP_K routed experts in `_routed_experts_fp8`'s storage
+    (copies): expert e is intermediate columns [e * inter, (e + 1) * inter).
+    `_dense_router` picks all of them at weight 1 / TOP_K, which the down
+    scales undo (exactly: a power of two, and the kernel's activation quant
+    scales by the block amax). The shared expert has a zero down projection."""
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    ug, s_ug, dn, s_dn = _dense_slices(mlp, inter)
+    hidden = ug.shape[1]
+    w13 = (
+        ug.view(2, TOP_K, inter, hidden)
+        .transpose(0, 1)
+        .reshape(TOP_K, 2 * inter, hidden)
+    )
+    s13 = (
+        s_ug.view(2, TOP_K, inter // 128, -1)
+        .transpose(0, 1)
+        .reshape(TOP_K, 2 * inter // 128, -1)
+    )
+    w2 = dn.view(hidden, TOP_K, inter).transpose(0, 1).contiguous()
+    s2 = s_dn.view(-1, TOP_K, inter // 128).transpose(0, 1) * TOP_K
+    w13, w2 = rocm_aiter_ops.shuffle_weights(w13.contiguous(), w2)
+    w13, w2 = w13.contiguous(), w2.contiguous()
+    w13.is_shuffled = w2.is_shuffled = True
+    return {
+        "w_ug": w13,
+        "s_ug": s13.contiguous(),
+        "w_dn": w2,
+        "s_dn": s2.contiguous(),
+        # any finite up / gate: the shared expert's down projection is zero
+        "w_ug_sh": w13[:1],
+        "s_ug_sh": s13[0].contiguous(),
+        "w_dn_sh": torch.zeros_like(w2[:1]),
+        "s_dn_sh": torch.ones_like(s2[0]),
+    }
+
+
+def _dense_router(hidden: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero router weights (every logit 0, so the picks weigh 1 / TOP_K each)
+    and a selection bias that picks experts 0 .. TOP_K - 1."""
+    bias = torch.zeros(N_ROUTED, dtype=torch.float32, device=device)
+    bias[:TOP_K] = 1.0
+    return torch.zeros(N_ROUTED, hidden, dtype=torch.bfloat16, device=device), bias
+
+
 @dataclass
 class MoeLayer:
     """One MoE layer's kernel inputs (`args`: launch-order tensors by name)."""
@@ -250,8 +391,11 @@ def build_moe_layer(layer, variant: KernelVariant, rank: int, npes: int) -> MoeL
     t["w_o"], t["s_o"] = _fp8_param(attn.o_proj)
     t["g_in"] = layer.input_layernorm.weight.to(torch.bfloat16).contiguous()
     t["g_post"] = layer.post_attention_layernorm.weight.to(torch.bfloat16).contiguous()
-    t["w_r"] = layer.mlp.gate.weight.to(torch.bfloat16).contiguous()
-    t["bias"] = torch.zeros(N_ROUTED, dtype=torch.float32, device=dev)
+    if spec.is_moe:
+        t["w_r"] = layer.mlp.gate.weight.to(torch.bfloat16).contiguous()
+        t["bias"] = torch.zeros(N_ROUTED, dtype=torch.float32, device=dev)
+    else:
+        t["w_r"], t["bias"] = _dense_router(hidden, dev)
 
     # fp32 parameter table read through the g_q pointer: indexer q LayerNorm,
     # attention and indexer SSMax
@@ -276,17 +420,25 @@ def build_moe_layer(layer, variant: KernelVariant, rank: int, npes: int) -> MoeL
         t["b_index_k"] = ix.k_norm.bias.float().contiguous()
     t["g_q"] = prm
 
-    t.update(_routed_experts(layer.mlp.experts))
-    shared = layer.mlp.shared_experts
-    if shared is None:
+    if not spec.is_moe:
+        t.update(_dense_mlp_fp8(layer.mlp, C.inter))
+        layouts = {}
+    elif layer.mlp.shared_experts is None:
         raise MonoUnsupported("MoE layer without a shared expert")
-    t.update(_shared_expert_mxfp4(shared))
+    elif GFX942:
+        t.update(_routed_experts_fp8(layer.mlp.experts))
+        t.update(_shared_expert_fp8(layer.mlp.shared_experts))
+        layouts = {}
+    else:
+        t.update(_routed_experts(layer.mlp.experts))
+        t.update(_shared_expert_mxfp4(layer.mlp.shared_experts))
+        layouts = dict(
+            mxfp4_weight_layout=Mxfp4WeightLayout.ATOM,
+            mxfp4_scale_layout=Mxfp4ScaleLayout.ATOM,
+        )
 
     W = LayerWeights(
-        nh, t, C, rank, npes,
-        mxfp4_weight_layout=Mxfp4WeightLayout.ATOM,
-        mxfp4_scale_layout=Mxfp4ScaleLayout.ATOM,
-        physical_experts=N_ROUTED,
+        nh, t, C, rank, npes, physical_experts=N_ROUTED, **layouts
     )  # fmt: skip
     packed = variant.op.prepare_ml4_weights(W, "fp8_block128")
     if ix is not None:

@@ -903,8 +903,16 @@ class ROCMAiterMLASparseMetadataBuilder(
                 self._mla_kv_dtype,
             )
         ):
-            with gpu_sync_allowed():
-                seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].cpu().numpy()
+            upper = common_attn_metadata.seq_lens_cpu_upper_bound
+            if upper is not None and self.vllm_config.speculative_config is None:
+                # exact without speculation; a device copy would wait for the
+                # previous step and stall async scheduling every decode step
+                seq_lens_cpu = upper[:num_reqs].numpy()
+            else:
+                with gpu_sync_allowed():
+                    seq_lens_cpu = (
+                        common_attn_metadata.seq_lens[:num_reqs].cpu().numpy()
+                    )
             clamped_seq_lens = np.minimum(
                 seq_lens_cpu,
                 self.topk_tokens,

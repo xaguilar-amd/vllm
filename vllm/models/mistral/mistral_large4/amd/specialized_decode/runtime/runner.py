@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-rank launch state of the Mistral Large 4 specialized decode.
 
-The embedding and the dense layer 0 run the original modules; every MoE layer
-(1..71) is one launch mapping the residual stream `x` ([rows, hidden]) to the
-next layer's `x` (attention, MoE and both TP all-reduces inside the kernel),
-alternating between two buffers; the final norm runs the original module. Each
+The embedding runs the original module, and so does the dense layer 0 unless
+`DecodeConfig.dense_layer` makes it a launch too; every MoE layer (1..71) is
+one launch mapping the residual stream `x` ([rows, hidden]) to the next layer's
+`x` (attention, MoE and both TP all-reduces inside the kernel), alternating
+between two buffers; the final norm runs the original module. Each
 row is one request's single decode token. The kernels read and write vLLM's
 own caches: the bf16 MLA latent pages ([blocks, page, 576]) and the DSA
 indexer's FP8 key pages ([blocks, page, 132]), through the step's block table
@@ -39,7 +40,7 @@ from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.runti
 
 from .spec import DecodeConfig
 from .variants import load_variant
-from .weights import KINDS, LayerKind, MoeLayer, build_moe_layer, moe_kinds
+from .weights import GFX942, KINDS, LayerKind, MoeLayer, build_moe_layer, moe_kinds
 
 logger = init_logger(__name__)
 
@@ -98,7 +99,9 @@ class MonoRunner:
         self.rank = get_tensor_model_parallel_rank()
         self.cpu_group = get_tp_group().cpu_group
         layers = list(model.layers)
-        self.kinds = kinds = moe_kinds(layers)
+        # launch i is layer i + first
+        self.first = first = config.first_layer
+        self.kinds = kinds = moe_kinds(layers, first)
         self.heads = layers[1].self_attn.num_local_heads
         self.layer_name = layers[1].self_attn.attn.layer_name
         self.index_name = layers[1].self_attn.indexer.k_cache.prefix
@@ -112,7 +115,7 @@ class MonoRunner:
         try:
             self.moe: list[MoeLayer] = [
                 build_moe_layer(layers[i], _variant(kind), self.rank, npes)
-                for i, kind in zip(range(1, len(layers)), kinds)
+                for i, kind in zip(range(first, len(layers)), kinds)
             ]
             torch.accelerator.synchronize()
         except Exception as why:  # e.g. OOM on one rank: every rank raises
@@ -137,11 +140,13 @@ class MonoRunner:
             for name, t in lw.args.items()
             if not name.startswith(("w_ug", "s_ug", "w_dn", "s_dn"))
             or name.endswith("_sh")
+            or not lw.attn.spec.is_moe  # the dense MLP's experts are copies
         )
         logger.info(
-            "Mistral Large 4 specialized decode: %d layer launches (%s), rows %s, "
-            "%.2f GiB of repacked weights per rank",
+            "Mistral Large 4 specialized decode: %d layer launches from layer %d "
+            "(%s), rows %s, %.2f GiB of repacked weights per rank",
             len(self.moe),
+            first,
             ", ".join(f"{k} x{kinds.count(k)}" for k in sorted(set(kinds))),
             self.widths,
             repacked / 2**30,
@@ -156,7 +161,7 @@ class MonoRunner:
         """The kernel's latent cache dtype, from the bound caches: `bf16` or
         `fp8` (E4M3, ATOM layout)."""
         # vLLM allocates an fp8 cache as uint8 and views it as fp8 per call
-        fp8 = {torch.float8_e4m3fn, torch.uint8}
+        fp8 = {torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.uint8}
         dtypes = {lw.attn.attn.kv_cache.dtype for lw in self.moe}
         if dtypes == {torch.bfloat16}:
             return "bf16"
@@ -181,14 +186,19 @@ class MonoRunner:
                 f"block table covers {index_max_seq} < max_model_len "
                 f"{self.max_model_len}"
             )
+        # gfx950: MXFP4 a4w4 experts on the scaled FP4 MFMA; gfx942: block-FP8
+        # experts in place (`weights._routed_experts_fp8`)
+        native_fp4 = not GFX942
         build_kwargs = dict(
             heads=heads, npes=npes, topk=cfg.topk,
             launches_per_step=len(self.moe), index_max_seq=index_max_seq,
             index_request_width=cfg.q, index_page_size=page,
             index_block_table_stride=block_table_stride, index_cache_dtype="fp8",
-            expert_mxfp4=True, atom_experts=True, attention_weight="fp8_block128",
-            kv_cache_layout="atom", kv_cache_dtype=kv_cache_dtype, native_fp4_mfma=True,
-            rope_dtype="fp32", uv_scale_rows=128, separate_shared=True,
+            expert_mxfp4=native_fp4, atom_experts=native_fp4,
+            aiter_fp8_experts=GFX942, attention_weight="fp8_block128",
+            kv_cache_layout="atom", kv_cache_dtype=kv_cache_dtype,
+            native_fp4_mfma=native_fp4, rope_dtype="fp32", uv_scale_rows=128,
+            separate_shared=True, own_key_counts=GFX942,
         )  # fmt: skip
         scratch_bytes: dict[tuple[bool, bool], int] = {}
         sym_bytes = 0
@@ -202,7 +212,7 @@ class MonoRunner:
                 inter = v.geometry_config.ml4_tp_config(npes).inter
                 scr, sym_l = v.layout.layout(
                     rows, heads, npes, cfg.topk, with_indexer, index_max_seq,
-                    inter=inter, native_fp4_mfma=True,
+                    inter=inter, native_fp4_mfma=native_fp4,
                 )  # fmt: skip
                 builds.append((rows, kind, v, inter, with_indexer))
                 key = (nope, kvs)
@@ -280,34 +290,40 @@ class MonoRunner:
             if inputs_embeds is not None
             else model.embed_input_ids(input_ids)
         )
-        log_positions = torch.log(positions.to(torch.float32) + 1)
-        layer0 = model.layers[0]
-        hidden, residual = layer0.input_norm(hidden, None)
         # aux hidden-state taps (DSpark): the residual stream entering layer idx,
         # as _stock_forward takes it after that layer's input norm
         taps = model.aux_hidden_state_layers
         aux_hidden_states: list[torch.Tensor] = []
-        if 0 in taps:
-            aux_hidden_states.append(residual.clone())
-        hidden, residual = layer0(
-            positions, hidden, residual, log_positions, model.rotary_emb
-        )
-        if layer0.defer_allreduce:
-            # the dense MLP left a TP-partial sum (its reduction is fused into
-            # the next layer's input norm, which the kernels replace)
-            hidden = tensor_model_parallel_all_reduce(hidden)
-        torch.add(hidden, residual, out=self.x[0][:rows])
+        if self.first == 0:
+            # launch 0 (layer 0) reads the embedding rows
+            assert hidden.is_contiguous() and hidden.dtype == torch.bfloat16
+            x_in = hidden
+        else:
+            log_positions = torch.log(positions.to(torch.float32) + 1)
+            layer0 = model.layers[0]
+            hidden, residual = layer0.input_norm(hidden, None)
+            if 0 in taps:
+                aux_hidden_states.append(residual.clone())
+            hidden, residual = layer0(
+                positions, hidden, residual, log_positions, model.rotary_emb
+            )
+            if layer0.defer_allreduce:
+                # the dense MLP left a TP-partial sum (its reduction is fused
+                # into the next layer's input norm, which the kernels replace)
+                hidden = tensor_model_parallel_all_reduce(hidden)
+            x_in = torch.add(hidden, residual, out=self.x[0][:rows])
         fwd = get_forward_context()
         block_table = fwd.attn_metadata[self.layer_name].block_table  # type: ignore[union-attr]
         slots = fwd.slot_mapping[self.layer_name]
-        # keys per row (cumulative): the whole context up to top-k, none for a
-        # padded row
-        nkeys = torch.where(
-            slots[:rows] >= 0,
-            torch.clamp(positions[:rows] + 1, max=self.config.topk),
-            0,
-        ).to(torch.int32)
-        self.indptr[1 : rows + 1].copy_(torch.cumsum(nkeys, 0))
+        if not GFX942:  # gfx942: the kernels count each row's keys themselves
+            # keys per row (cumulative): the whole context up to top-k, none
+            # for a padded row
+            nkeys = torch.where(
+                slots[:rows] >= 0,
+                torch.clamp(positions[:rows] + 1, max=self.config.topk),
+                0,
+            ).to(torch.int32)
+            self.indptr[1 : rows + 1].copy_(torch.cumsum(nkeys, 0))
         rope_scratch = self.scratch[(False, False)]
         stream = torch.cuda.current_stream()
         for i, lw in enumerate(self.moe):
@@ -318,12 +334,12 @@ class MonoRunner:
             else:
                 index_arg = _ptr(lw.attn.indexer.k_cache.kv_cache)
             nope, kvs, _ = KINDS[lw.kind]
-            if i + 1 in taps:
-                # launch i is layer i + 1 and reads x[i % 2]; launch i + 1
-                # overwrites it
-                aux_hidden_states.append(self.x[i % 2][:rows].clone())
+            # launch i reads x[i % 2] (launch 0: x_in); launch i + 1 overwrites it
+            src = x_in if i == 0 else self.x[i % 2]
+            if i + self.first in taps:
+                aux_hidden_states.append(src[:rows].clone())
             self.launch[(rows, lw.kind)](
-                _ptr(self.x[i % 2]), _ptr(self.x[(i + 1) % 2]), _ptr(block_table),
+                _ptr(src), _ptr(self.x[(i + 1) % 2]), _ptr(block_table),
                 _ptr(positions), _ptr(slots), _ptr(self.indptr),
                 _ptr(kv), _ptr(kv), index_arg, _ptr(self.cos), _ptr(self.sin),
                 *(_ptr(a[name]) for name in _WEIGHT_ARGS),

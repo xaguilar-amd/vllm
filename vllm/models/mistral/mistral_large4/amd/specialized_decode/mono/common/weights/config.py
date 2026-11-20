@@ -18,6 +18,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.arch import (  # noqa: E501
+    GFX942,
+)
+
 """Shared model geometry, arithmetic formats, and storage-layout contracts."""
 
 
@@ -206,7 +210,15 @@ EPS = 1e-5
 SCALE_BM = 128
 
 
-FP8_MAX = 448.0
+# The FP8 activations and the latent KV cache saturate at the format's largest
+# finite e4m3: 448 for OCP (gfx950), 240 for FNUZ (gfx942), as vLLM's and
+# aiter's writers do.
+FP8_MAX = 240.0 if GFX942 else 448.0
+
+
+# The indexer K cache scales its rows to this, as vLLM's writer does: 224 for
+# FNUZ.
+INDEX_FP8_MAX = 224.0 if GFX942 else 448.0
 
 
 SUPPORTED_SAMPLES = (1, 2, 4, 8)
